@@ -13,6 +13,12 @@ const work = path.join(project, 'work');
 const roots = [];
 fs.mkdirSync(work, { recursive: true });
 
+function spawnHookCommand(command, options) {
+  return process.platform === 'win32'
+    ? spawnSync('pwsh.exe', ['-NoProfile', '-Command', command], options)
+    : spawnSync(command, { ...options, shell: true });
+}
+
 after(() => {
   for (const root of roots) {
     assert.ok(root.startsWith(work + path.sep));
@@ -413,9 +419,8 @@ test('recursion guard exits without creating checkpoint state', () => {
   const handler = manifest.hooks.PreCompact[0].hooks[0];
   const command = process.platform === 'win32' ? handler.commandWindows : handler.command;
   const guardedData = path.join(f.root, 'guarded-state');
-  const result = spawnSync(command, {
+  const result = spawnHookCommand(command, {
     cwd: f.workspace,
-    shell: true,
     input: JSON.stringify(f.event('PreCompact')),
     encoding: 'utf8',
     env: {
@@ -435,9 +440,8 @@ test('hook command accepts Codex JSON on stdin', () => {
   const handler = manifest.hooks.PreCompact[0].hooks[0];
   const command = process.platform === 'win32' ? handler.commandWindows : handler.command;
   const commandData = path.join(f.root, 'command-state');
-  const result = spawnSync(command, {
+  const result = spawnHookCommand(command, {
     cwd: f.workspace,
-    shell: true,
     input: JSON.stringify(f.event('PreCompact', 'command-turn', 'command-session')),
     encoding: 'utf8',
     env: {
@@ -457,9 +461,8 @@ test('Windows hook launcher ignores a workspace-provided node command', { skip: 
   fs.writeFileSync(path.join(f.workspace, 'node.cmd'), `@echo off\r\ntype nul > "${marker}"\r\n`);
   const manifest = JSON.parse(fs.readFileSync(path.join(project, 'hooks', 'hooks.json'), 'utf8'));
   const command = manifest.hooks.PreCompact[0].hooks[0].commandWindows;
-  const result = spawnSync(command, {
+  const result = spawnHookCommand(command, {
     cwd: f.workspace,
-    shell: true,
     input: JSON.stringify(f.event('PreCompact')),
     encoding: 'utf8',
     env: { ...f.env, PLUGIN_ROOT: project },

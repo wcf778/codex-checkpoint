@@ -19,6 +19,7 @@ const SEMANTIC_KEYS = [
 const SEMANTIC_GOAL_MAX = 200;
 const SEMANTIC_ITEMS_MAX = 3;
 const SEMANTIC_ITEM_MAX = 50;
+const RESTORE_CONTEXT_LIMIT = 2500;
 
 function sha256(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
@@ -217,6 +218,55 @@ function renderMarkdown(checkpoint) {
   return `${lines.join('\n')}\n`;
 }
 
+function truncateUtf8(value, maximum) {
+  const buffer = Buffer.from(value, 'utf8');
+  if (buffer.length <= maximum) return value;
+  const suffix = Buffer.from('…', 'utf8');
+  if (maximum < suffix.length) return '';
+  let end = maximum - suffix.length;
+  while (end > 0 && (buffer[end] & 0xc0) === 0x80) end -= 1;
+  return `${buffer.subarray(0, end).toString('utf8')}…`;
+}
+
+function renderRestoreContext(checkpoint) {
+  const semantic = checkpoint.semantic || emptySemantic();
+  const sections = [
+    ['Goal', semantic.goal ? [semantic.goal] : []],
+    ['Next actions', semantic.next_actions],
+    ['Current progress', semantic.current_progress],
+    ['Constraints', semantic.constraints],
+    ['Decisions', semantic.decisions],
+    ['Do not retry', semantic.negative_knowledge],
+    ['Open questions', semantic.open_questions],
+    ['Acceptance criteria', semantic.acceptance_criteria],
+  ];
+  const values = sections.flatMap(([, items]) => items || []);
+  const render = (content) => {
+    let index = 0;
+    const lines = ['# Context restore'];
+    for (const [title, items] of sections) {
+      if (!items?.length) continue;
+      lines.push('', `## ${title}`, '', ...items.map(() => `- ${content[index++]}`));
+    }
+    return `${lines.join('\n')}\n`;
+  };
+  const full = render(values);
+  if (Buffer.byteLength(full, 'utf8') <= RESTORE_CONTEXT_LIMIT) return full;
+
+  const fixed = render(values.map(() => ''));
+  const budget = RESTORE_CONTEXT_LIMIT - Buffer.byteLength(fixed, 'utf8');
+  const total = values.reduce((sum, value) => sum + Buffer.byteLength(value, 'utf8'), 0);
+  const fitted = values.map((value) => truncateUtf8(
+    value,
+    Math.floor(budget * Buffer.byteLength(value, 'utf8') / total),
+  ));
+  const result = render(fitted);
+  if (Buffer.byteLength(result, 'utf8') > RESTORE_CONTEXT_LIMIT) {
+    throw new Error('restore context exceeds hook limit');
+  }
+  return result;
+}
+
 function readRange(file, start, length) {
   const buffer = Buffer.alloc(length);
   if (!length) return buffer;
@@ -399,17 +449,22 @@ function withLock(file, fn) {
   }
 }
 
-function shouldRunSidecar(checkpoint, meta, env = process.env) {
+function sidecarDue(checkpoint, meta, env) {
   const every = Number.parseInt(env.CONTEXT_CHECKPOINT_SIDECAR_EVERY || '0', 10);
-  const minimum = Number.parseInt(env.CONTEXT_CHECKPOINT_SIDECAR_MIN_BYTES || '32768', 10);
   const nextCompletedGeneration = (meta.completed_generations || 0) + 1;
   return checkpoint.transcript_delta.status === 'captured'
     && Number.isInteger(every)
     && every > 0
     && nextCompletedGeneration % every === 0
-    && checkpoint.transcript_delta.bytes >= Math.max(0, minimum || 0)
     && !semanticCoversDelta(checkpoint.semantic_transcript, checkpoint.transcript_delta)
     && (meta.semantic_generation || 0) < checkpoint.generation;
+}
+
+function shouldRunSidecar(checkpoint, meta, env = process.env, unseenPaths = []) {
+  if (!sidecarDue(checkpoint, meta, env)) return false;
+  const minimum = Number.parseInt(env.CONTEXT_CHECKPOINT_SIDECAR_MIN_BYTES || '32768', 10);
+  const unseenBytes = unseenPaths.reduce((total, file) => total + fs.statSync(file).size, 0);
+  return unseenBytes >= Math.max(0, minimum || 0);
 }
 
 function runSidecar(checkpoint, ctx, env = process.env, spawn = spawnSync) {
@@ -482,10 +537,11 @@ function historyPath(ctx, generation) {
   return path.join(ctx.history, `generation-${String(generation).padStart(4, '0')}.json`);
 }
 
-function pruneOldGenerations(ctx, generation, env) {
+function pruneOldGenerations(ctx, generation, semanticGeneration, env) {
   const retain = Number.parseInt(env.CONTEXT_CHECKPOINT_RETENTION_GENERATIONS || '50', 10);
   if (!Number.isInteger(retain) || retain < 1 || generation <= retain) return;
-  const cutoff = generation - retain;
+  const cutoff = Math.min(generation - retain, semanticGeneration || 0);
+  if (cutoff < 1) return;
   for (const directory of [ctx.history, ctx.deltas]) {
     let entries;
     try { entries = fs.readdirSync(directory); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
@@ -577,12 +633,11 @@ function handlePreCompact(input, env, deps) {
       writeJson(ctx.meta, meta);
     }
 
-    if (shouldRunSidecar(checkpoint, meta, env)) {
-      checkpoint.sidecar_delta_paths = unseenDeltaPaths(
-        ctx,
-        meta.semantic_generation || 0,
-        checkpoint,
-      );
+    const unseenPaths = sidecarDue(checkpoint, meta, env)
+      ? unseenDeltaPaths(ctx, meta.semantic_generation || 0, checkpoint)
+      : [];
+    if (shouldRunSidecar(checkpoint, meta, env, unseenPaths)) {
+      checkpoint.sidecar_delta_paths = unseenPaths;
       checkpoint.sidecar = deps.runSidecar(checkpoint, ctx, env, deps.spawnSync);
       if (checkpoint.sidecar.status === 'completed') {
         checkpoint.semantic = checkpoint.sidecar.semantic;
@@ -627,7 +682,7 @@ function handlePostCompact(input, env) {
     writeCheckpoint(ctx, checkpoint);
     writeJson(ctx.meta, meta);
     armRecovery(ctx, checkpoint);
-    pruneOldGenerations(ctx, checkpoint.generation, env);
+    pruneOldGenerations(ctx, checkpoint.generation, meta.semantic_generation, env);
     return { action: 'completed', generation: checkpoint.generation };
   });
 }
@@ -678,11 +733,10 @@ function deliverRecovery(input, env, hookEventName, emitHookOutput) {
       clearRecovery(ctx.recovery);
       return null;
     }
-    const markdown = fs.readFileSync(ctx.markdown, 'utf8');
     const output = {
       hookSpecificOutput: {
         hookEventName,
-        additionalContext: markdown,
+        additionalContext: renderRestoreContext(checkpoint),
       },
     };
     if (emitHookOutput) {
@@ -762,14 +816,23 @@ function pathInside(base, candidate) {
     : selected.startsWith(root);
 }
 
-function cliContext(env, sessionId) {
+function cliContext(env, threadId, sessionId) {
   const workspace = workspaceSnapshot(process.cwd());
   const base = cliBase(env, workspace);
   const sessions = listSessions(base);
-  if (!sessionId && sessions.length > 1) {
-    throw new Error(`multiple sessions found; pass --session-id (${sessions.join(', ')})`);
+  if (threadId && sessionId) throw new Error('pass either --thread-id or --session-id, not both');
+  if (!threadId && !sessionId && sessions.length > 1) {
+    throw new Error(`multiple threads found; pass --thread-id (${sessions.join(', ')})`);
   }
-  const selectedId = sessionId ? safeSegment(sessionId) : sessions[0];
+  let selectedId = threadId ? safeSegment(threadId) : sessions[0];
+  if (sessionId) {
+    const rootTasks = sessions.filter((id) => {
+      const current = readJson(path.join(base, 'sessions', id, 'current.json'));
+      return current?.session_id === sessionId && !current.agent_id;
+    });
+    if (rootTasks.length !== 1) throw new Error(`no root task found for session ${sessionId}`);
+    [selectedId] = rootTasks;
+  }
   const selected = selectedId ? path.join(base, 'sessions', selectedId) : null;
   if (!selected || !pathInside(base, selected)) {
     throw new Error('no checkpoint found for this workspace');
@@ -802,6 +865,8 @@ function runCli(argv, env) {
       const sessionDir = path.join(base, 'sessions', sessionId);
       const current = readJson(path.join(sessionDir, 'current.json'));
       const summary = {
+        selector: current?.thread_id || sessionId,
+        kind: current?.agent_id ? 'agent' : 'root',
         session_id: current?.session_id || sessionId,
         agent_id: current?.agent_id || null,
         thread_id: current?.thread_id || sessionId,
@@ -827,7 +892,7 @@ function runCli(argv, env) {
     process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
     return;
   }
-  const ctx = cliContext(env, option(argv, '--session-id'));
+  const ctx = cliContext(env, option(argv, '--thread-id'), option(argv, '--session-id'));
   const checkpoint = readJson(ctx.current);
   if (!checkpoint) throw new Error('checkpoint state is missing');
   if (command === 'status') {
@@ -921,6 +986,7 @@ module.exports = {
   handleHook,
   main,
   renderMarkdown,
+  renderRestoreContext,
   resolveContext,
   runSidecar,
   shouldRunSidecar,

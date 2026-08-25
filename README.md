@@ -33,13 +33,14 @@ After a long task has crossed several compaction boundaries, its recovery state 
 
 - `PreCompact` captures only unseen transcript bytes
 - `PostCompact` commits the completed generation and transcript cursor
-- `SessionStart` restores only when freshness checks pass
+- `SessionStart` restores root tasks only when freshness checks pass; `UserPromptSubmit` is a one-shot fallback for compacted subtasks
 
 ## Why Codex Checkpoint
 
 - **Low overhead by default** — deterministic Node.js hooks make no network request and launch no model.
 - **Incremental, not cumulative** — each generation stores only the uncommitted transcript byte range.
 - **Freshness-gated recovery** — replaced, rewritten, stale, or mismatched transcripts are not auto-injected.
+- **Observable, one-shot restore** — stable eligibility reasons explain every restore decision, while root and subtask fallbacks consume a generation only after successful delivery.
 - **Failure-safe lifecycle** — the completed-generation count and committed transcript cursor advance only during `PostCompact`.
 - **No repository pollution** — state lives under Codex/plugin data, never in the target workspace.
 - **Semantic refresh when useful** — a manual skill and an opt-in read-only sidecar can preserve bounded task semantics.
@@ -59,7 +60,7 @@ Run it with `npm run benchmark`. This is an input-byte proxy from a synthetic fi
 
 ### Lifecycle and failure-mode coverage
 
-The repository includes **25 automated tests** covering lock ownership, idempotency, transcript replacement and rewrite detection, stale-state rejection, atomic metadata updates, retention, sidecar isolation, recursion guards, CLI ambiguity, Windows launcher behavior, and bounded schema validation.
+The repository includes **33 automated tests** covering lock ownership, idempotency, transcript replacement and rewrite detection, stale-state rejection, exact-once root and subtask recovery, failed-output retry, restore diagnostics, retained-history inspection, storage reporting, atomic metadata updates, retention, sidecar isolation, recursion guards, CLI ambiguity, Windows launcher behavior, and bounded schema validation.
 
 ```bash
 cd plugins/context-checkpoint
@@ -75,7 +76,8 @@ Codex task
   -> PreCompact: capture deterministic delta + workspace marker
   -> native compact: primary semantic compression
   -> PostCompact: commit generation + transcript cursor
-  -> SessionStart(compact): restore only after freshness checks pass
+  -> SessionStart(compact): one-shot root restore after freshness checks
+  -> UserPromptSubmit: one-shot fallback when a compacted subtask has no SessionStart
 ```
 
 `$context-checkpoint` can additionally refresh a bounded semantic record containing Goal, Constraints, Decisions, Progress, Negative Knowledge, Open Questions, and Next Actions.
@@ -122,12 +124,15 @@ Run these commands from the plugin directory:
 
 ```bash
 node hooks/context-checkpoint.cjs sessions
+node hooks/context-checkpoint.cjs sessions --storage
 node hooks/context-checkpoint.cjs status --session-id <id>
+node hooks/context-checkpoint.cjs history --session-id <id>
 node hooks/context-checkpoint.cjs show --session-id <id>
+node hooks/context-checkpoint.cjs show --generation <n> --session-id <id>
 node hooks/context-checkpoint.cjs semantic --input checkpoint.json --session-id <id>
 ```
 
-Manual commands refuse to guess when a workspace has multiple sessions.
+Manual commands refuse to guess when a workspace has multiple sessions. `status` explains restore eligibility, `history` indexes retained generations, and `sessions --storage` reports per-thread bytes, last update, restore eligibility, and workspace totals without deleting anything.
 
 </details>
 
@@ -159,6 +164,7 @@ The child runs with `codex exec --ephemeral --sandbox read-only`, hooks disabled
 - Raw transcript deltas are stored under `PLUGIN_DATA/workspaces/<workspace-id>/context-checkpoint`. If `PLUGIN_DATA` is unavailable, the fallback is under `CODEX_HOME/plugin-data/context-checkpoint`; state is never written to the target repository.
 - Transcript deltas can contain sensitive conversation content. Protect the Codex data directory with normal user-directory permissions.
 - A single delta is limited to 64 MiB by default, and the newest 50 generations are retained. Override these with `CONTEXT_CHECKPOINT_MAX_DELTA_BYTES` and `CONTEXT_CHECKPOINT_RETENTION_GENERATIONS`.
+- Historical sessions are not deleted automatically. Inspect their size with `sessions --storage`; cleanup remains an explicit operator action.
 - The deterministic hook path makes no network request. Enabling the sidecar explicitly sends its prompt through the configured Codex execution path.
 
 ## Development

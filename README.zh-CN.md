@@ -33,13 +33,14 @@
 
 - `PreCompact` 只捕获尚未处理的 transcript 字节
 - `PostCompact` 提交已完成的 generation 和 transcript cursor
-- `SessionStart` 仅在通过新鲜度校验后恢复
+- `SessionStart` 仅在通过新鲜度校验后恢复根任务；`UserPromptSubmit` 为压缩后的子任务提供一次性兜底
 
 ## 为什么选择 Codex Checkpoint
 
 - **默认开销低** — 确定性的 Node.js hooks 不访问网络，也不启动模型。
 - **增量而非累积** — 每个 generation 只保存尚未提交的 transcript 字节区间。
 - **通过新鲜度校验才恢复** — 被替换、重写、过期或不匹配的 transcript 不会自动注入。
+- **可解释的一次性恢复** — 稳定的判定原因解释每次恢复决定；根任务与子任务只有在成功注入后才消费当前 generation。
 - **故障安全的生命周期** — completed-generation 计数和已提交的 transcript cursor 只在 `PostCompact` 阶段推进。
 - **不污染目标仓库** — 状态保存在 Codex/plugin data 下，不写入目标工作区。
 - **按需刷新语义** — 手动 Skill 和可选只读 sidecar 可保存有边界的任务语义。
@@ -59,7 +60,7 @@
 
 ### 生命周期与故障模式覆盖
 
-仓库包含 **25 个自动化测试**，覆盖锁所有权、幂等性、transcript 替换与原地重写检测、过期状态拒绝、原子元数据更新、保留策略、sidecar 隔离、递归保护、CLI session 歧义、Windows 启动器和有界 Schema 校验。
+仓库包含 **33 个自动化测试**，覆盖锁所有权、幂等性、transcript 替换与原地重写检测、过期状态拒绝、根任务与子任务的一次性恢复、输出失败重试、恢复诊断、历史查看、容量报告、原子元数据更新、保留策略、sidecar 隔离、递归保护、CLI session 歧义、Windows 启动器和有界 Schema 校验。
 
 ```bash
 cd plugins/context-checkpoint
@@ -75,7 +76,8 @@ Codex 任务
   -> PreCompact：捕获确定性增量 + 工作区状态标记
   -> 原生 compact：主要语义压缩
   -> PostCompact：提交 generation + transcript cursor
-  -> SessionStart(compact)：仅在通过新鲜度校验后恢复
+  -> SessionStart(compact)：通过新鲜度校验后一次性恢复根任务
+  -> UserPromptSubmit：子任务没有 SessionStart 时的一次性兜底
 ```
 
 `$context-checkpoint` 还能按需刷新有边界的语义记录，包括目标、约束、决策、进度、失败经验、开放问题和下一步行动。
@@ -122,12 +124,15 @@ $context-checkpoint 刷新当前任务检查点
 
 ```bash
 node hooks/context-checkpoint.cjs sessions
+node hooks/context-checkpoint.cjs sessions --storage
 node hooks/context-checkpoint.cjs status --session-id <id>
+node hooks/context-checkpoint.cjs history --session-id <id>
 node hooks/context-checkpoint.cjs show --session-id <id>
+node hooks/context-checkpoint.cjs show --generation <n> --session-id <id>
 node hooks/context-checkpoint.cjs semantic --input checkpoint.json --session-id <id>
 ```
 
-同一工作区存在多个 session 时，手动命令会要求明确指定 `--session-id`，不会自行猜测。
+同一工作区存在多个 session 时，手动命令会要求明确指定 `--session-id`，不会自行猜测。`status` 解释恢复资格，`history` 索引已保留的 generation，`sessions --storage` 报告每个线程的字节数、最后更新时间、恢复资格和工作区总量，不执行删除。
 
 </details>
 
@@ -159,6 +164,7 @@ $env:CONTEXT_CHECKPOINT_SIDECAR_MIN_BYTES = '32768'
 - 原始 transcript 增量保存在 `PLUGIN_DATA/workspaces/<workspace-id>/context-checkpoint`。如果没有 `PLUGIN_DATA`，则回退到 `CODEX_HOME/plugin-data/context-checkpoint`；状态不会写入目标仓库。
 - Transcript 增量可能包含敏感对话内容，请使用正常的用户目录权限保护 Codex 数据目录。
 - 单次增量默认上限为 64 MiB，并保留最近 50 个 generation。可通过 `CONTEXT_CHECKPOINT_MAX_DELTA_BYTES` 和 `CONTEXT_CHECKPOINT_RETENTION_GENERATIONS` 调整。
+- 历史 session 不会自动删除。可先用 `sessions --storage` 检查容量；清理仍须由操作者显式执行。
 - 确定性 hook 路径不会发起网络请求。只有显式启用 sidecar 后，提示内容才会通过已配置的 Codex 执行路径发送。
 
 ## 开发

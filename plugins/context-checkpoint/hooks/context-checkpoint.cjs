@@ -59,12 +59,12 @@ function runGit(cwd, args) {
   return result.status === 0 ? result.stdout.trim() : null;
 }
 
-function workspaceSnapshot(cwd) {
+function workspaceSnapshot(cwd, includeStatus = true) {
   const requested = path.resolve(cwd || process.cwd());
   const gitMetadata = runGit(requested, ['rev-parse', '--show-toplevel', '--absolute-git-dir']);
   const [gitRoot, gitDir] = gitMetadata ? gitMetadata.split(/\r?\n/) : [null, null];
   const root = path.resolve(gitRoot || requested);
-  const status = gitRoot ? runGit(root, ['status', '--porcelain=v2', '--branch']) : '';
+  const status = gitRoot && includeStatus ? runGit(root, ['status', '--porcelain=v2', '--branch']) : '';
   const statusLines = (status || '').split(/\r?\n/).filter(Boolean);
   const head = statusLines.find((line) => line.startsWith('# branch.oid '))?.slice(13) || null;
   const branch = statusLines.find((line) => line.startsWith('# branch.head '))?.slice(14) || null;
@@ -83,7 +83,7 @@ function workspaceSnapshot(cwd) {
     status_sha256: sha256(statusText),
     identity: sha256(identityMaterial),
     status_fingerprint: sha256([head || '', branch || '', statusText].join('\n')),
-    fingerprint_kind: gitRoot ? 'git-status-v2' : 'non-git-identity',
+    fingerprint_kind: gitRoot && includeStatus ? 'git-status-v2' : 'identity-only',
   };
 }
 
@@ -100,12 +100,26 @@ function defaultDataBase(env, workspace) {
   return path.join(codexHome, 'plugin-data', 'context-checkpoint', 'workspaces', workspace.identity);
 }
 
-function resolveContext(input, env = process.env) {
-  const workspace = workspaceSnapshot(input.cwd);
+function recoveryPath(input, env = process.env) {
+  const threadId = safeSegment(input.agent_id || input.session_id);
+  if (env.CONTEXT_CHECKPOINT_DATA_DIR) {
+    return path.join(path.resolve(env.CONTEXT_CHECKPOINT_DATA_DIR), 'recovery-pending', `${threadId}.json`);
+  }
+  if (env.PLUGIN_DATA) {
+    return path.join(path.resolve(env.PLUGIN_DATA), 'recovery-pending', 'context-checkpoint', `${threadId}.json`);
+  }
+  const codexHome = path.resolve(env.CODEX_HOME || path.join(os.homedir(), '.codex'));
+  return path.join(codexHome, 'plugin-data', 'context-checkpoint', 'recovery-pending', `${threadId}.json`);
+}
+
+function resolveContext(input, env = process.env, includeStatus = true) {
+  const workspace = workspaceSnapshot(input.cwd, includeStatus);
   const base = defaultDataBase(env, workspace);
-  const sessionDir = path.join(base, 'sessions', safeSegment(input.session_id));
+  const threadId = input.agent_id || input.session_id;
+  const sessionDir = path.join(base, 'sessions', safeSegment(threadId));
   return {
     workspace,
+    threadId,
     base,
     sessionDir,
     meta: path.join(sessionDir, 'state.json'),
@@ -114,6 +128,7 @@ function resolveContext(input, env = process.env) {
     history: path.join(sessionDir, 'history'),
     deltas: path.join(sessionDir, 'deltas'),
     lock: path.join(sessionDir, '.lock'),
+    recovery: recoveryPath(input, env),
   };
 }
 
@@ -487,18 +502,33 @@ function writeCheckpoint(ctx, checkpoint) {
   writeJson(historyPath(ctx, checkpoint.generation), checkpoint);
 }
 
+function clearRecovery(file) {
+  try { fs.unlinkSync(file); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+}
+
+function armRecovery(ctx, checkpoint) {
+  writeJson(ctx.recovery, {
+    generation: checkpoint.generation,
+    turn_id: checkpoint.turn_id,
+    created_at: now(),
+  });
+}
+
 function handlePreCompact(input, env, deps) {
   const ctx = resolveContext(input, env);
   return withLock(ctx.lock, () => {
     const meta = readJson(ctx.meta, {
       schema_version: SCHEMA_VERSION,
       session_id: input.session_id,
+      agent_id: input.agent_id || null,
+      thread_id: ctx.threadId,
       generation: 0,
       completed_generations: 0,
       semantic_generation: 0,
       cursor: { path: null, offset: 0 },
     });
     const previous = readJson(ctx.current);
+    clearRecovery(ctx.recovery);
     if (!Number.isInteger(meta.completed_generations)) {
       meta.completed_generations = previous?.status === 'complete'
         ? meta.generation
@@ -519,6 +549,8 @@ function handlePreCompact(input, env, deps) {
     const checkpoint = {
       schema_version: SCHEMA_VERSION,
       session_id: input.session_id,
+      agent_id: input.agent_id || null,
+      thread_id: ctx.threadId,
       turn_id: input.turn_id,
       generation,
       status: 'preparing',
@@ -594,39 +626,74 @@ function handlePostCompact(input, env) {
     }
     writeCheckpoint(ctx, checkpoint);
     writeJson(ctx.meta, meta);
+    armRecovery(ctx, checkpoint);
     pruneOldGenerations(ctx, checkpoint.generation, env);
     return { action: 'completed', generation: checkpoint.generation };
   });
 }
 
-function handleSessionStart(input, env) {
-  const ctx = resolveContext(input, env);
-  const checkpoint = readJson(ctx.current);
-  if (!checkpoint || checkpoint.status !== 'complete') return null;
-  if (checkpoint.workspace_before.identity !== ctx.workspace.identity) return null;
+function assessRestore(checkpoint, ctx) {
+  if (!checkpoint) return { restore_eligible: false, restore_reason: 'checkpoint_missing' };
+  if (checkpoint.status !== 'complete') return { restore_eligible: false, restore_reason: 'checkpoint_incomplete' };
+  if (checkpoint.workspace_before.identity !== ctx.workspace.identity) {
+    return { restore_eligible: false, restore_reason: 'workspace_mismatch' };
+  }
   const semantic = checkpoint.semantic || emptySemantic();
-  if (!semantic.goal && !SEMANTIC_KEYS.some((key) => semantic[key]?.length)) return null;
+  if (!semantic.goal && !SEMANTIC_KEYS.some((key) => semantic[key]?.length)) {
+    return { restore_eligible: false, restore_reason: 'semantic_empty' };
+  }
   const coverage = checkpoint.semantic_transcript;
   const transcript = checkpoint.transcript_delta.path;
-  if (!coverage || !transcript || !fs.existsSync(transcript)) return null;
+  if (!coverage) return { restore_eligible: false, restore_reason: 'coverage_missing' };
+  if (!transcript || !fs.existsSync(transcript)) {
+    return { restore_eligible: false, restore_reason: 'transcript_missing' };
+  }
   const stat = fs.statSync(transcript);
-  if (coverage.end_offset !== checkpoint.transcript_delta.end_offset
-    || stat.size < coverage.end_offset
+  if (coverage.end_offset !== checkpoint.transcript_delta.end_offset) {
+    return { restore_eligible: false, restore_reason: 'coverage_mismatch' };
+  }
+  if (stat.size < coverage.end_offset
     || !sameTranscriptSource(path.resolve(transcript), stat, {
       path: coverage.path,
       offset: coverage.end_offset,
       source_identity: coverage.source_identity,
-    })
-    || !onlyCompactionMetadata(transcript, coverage.end_offset, stat.size)) {
-    return null;
+    })) {
+    return { restore_eligible: false, restore_reason: 'transcript_source_changed' };
   }
-  const markdown = fs.readFileSync(ctx.markdown, 'utf8');
-  return {
-    hookSpecificOutput: {
-      hookEventName: 'SessionStart',
-      additionalContext: markdown,
-    },
-  };
+  if (!onlyCompactionMetadata(transcript, coverage.end_offset, stat.size)) {
+    return { restore_eligible: false, restore_reason: 'unexpected_transcript_tail' };
+  }
+  return { restore_eligible: true, restore_reason: 'eligible' };
+}
+
+function deliverRecovery(input, env, hookEventName, emitHookOutput) {
+  const pendingPath = recoveryPath(input, env);
+  if (!fs.existsSync(pendingPath)) return null;
+  const ctx = resolveContext(input, env, false);
+  const result = withLock(ctx.lock, () => {
+    const checkpoint = readJson(ctx.current);
+    const pending = readJson(ctx.recovery);
+    if (!pending || pending.generation !== checkpoint?.generation) return null;
+    if (!assessRestore(checkpoint, ctx).restore_eligible) {
+      clearRecovery(ctx.recovery);
+      return null;
+    }
+    const markdown = fs.readFileSync(ctx.markdown, 'utf8');
+    const output = {
+      hookSpecificOutput: {
+        hookEventName,
+        additionalContext: markdown,
+      },
+    };
+    if (emitHookOutput) {
+      emitHookOutput(output);
+      clearRecovery(ctx.recovery);
+      return { action: 'delivered' };
+    }
+    clearRecovery(ctx.recovery);
+    return output;
+  });
+  return result?.action === 'locked' ? null : result;
 }
 
 function handleHook(input, env = process.env, deps = {}) {
@@ -634,7 +701,10 @@ function handleHook(input, env = process.env, deps = {}) {
   if (input.hook_event_name === 'PreCompact') return handlePreCompact(input, env, resolved);
   if (input.hook_event_name === 'PostCompact') return handlePostCompact(input, env);
   if (input.hook_event_name === 'SessionStart' && input.source === 'compact') {
-    return handleSessionStart(input, env);
+    return deliverRecovery(input, env, 'SessionStart', resolved.emitHookOutput);
+  }
+  if (input.hook_event_name === 'UserPromptSubmit') {
+    return deliverRecovery(input, env, 'UserPromptSubmit', resolved.emitHookOutput);
   }
   return null;
 }
@@ -654,6 +724,34 @@ function listSessions(base) {
     if (error.code === 'ENOENT') return [];
     throw error;
   }
+}
+
+function directorySize(directory) {
+  let total = 0;
+  let entries;
+  try { entries = fs.readdirSync(directory, { withFileTypes: true }); } catch (error) {
+    if (error.code === 'ENOENT') return 0;
+    throw error;
+  }
+  for (const entry of entries) {
+    const file = path.join(directory, entry.name);
+    if (entry.isDirectory()) total += directorySize(file);
+    else if (entry.isFile()) total += fs.statSync(file).size;
+  }
+  return total;
+}
+
+function listHistory(ctx) {
+  let entries;
+  try { entries = fs.readdirSync(ctx.history); } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+  return entries
+    .filter((entry) => /^generation-\d+\.json$/.test(entry))
+    .map((entry) => readJson(path.join(ctx.history, entry)))
+    .filter(Boolean)
+    .sort((left, right) => left.generation - right.generation);
 }
 
 function pathInside(base, candidate) {
@@ -677,6 +775,7 @@ function cliContext(env, sessionId) {
     throw new Error('no checkpoint found for this workspace');
   }
   return {
+    workspace,
     base,
     sessionDir: selected,
     current: path.join(selected, 'current.json'),
@@ -684,6 +783,7 @@ function cliContext(env, sessionId) {
     meta: path.join(selected, 'state.json'),
     history: path.join(selected, 'history'),
     lock: path.join(selected, '.lock'),
+    recovery: recoveryPath({ session_id: selectedId }, env),
   };
 }
 
@@ -697,16 +797,34 @@ function runCli(argv, env) {
   if (command === 'sessions') {
     const workspace = workspaceSnapshot(process.cwd());
     const base = cliBase(env, workspace);
+    const includeStorage = argv.includes('--storage');
     const sessions = listSessions(base).map((sessionId) => {
-      const current = readJson(path.join(base, 'sessions', sessionId, 'current.json'));
-      return {
+      const sessionDir = path.join(base, 'sessions', sessionId);
+      const current = readJson(path.join(sessionDir, 'current.json'));
+      const summary = {
         session_id: current?.session_id || sessionId,
+        agent_id: current?.agent_id || null,
+        thread_id: current?.thread_id || sessionId,
         generation: current?.generation || 0,
         status: current?.status || 'unknown',
+        delta_bytes: current?.transcript_delta?.bytes || 0,
+        semantic_source: current?.semantic_source || 'empty',
         updated_at: current?.completed_at || current?.created_at || null,
       };
+      if (includeStorage) {
+        Object.assign(summary, assessRestore(current, { workspace }), {
+          stored_bytes: directorySize(sessionDir),
+        });
+      }
+      return summary;
     });
-    process.stdout.write(`${JSON.stringify(sessions, null, 2)}\n`);
+    const output = includeStorage
+      ? {
+        sessions,
+        workspace_total_bytes: sessions.reduce((total, session) => total + session.stored_bytes, 0),
+      }
+      : sessions;
+    process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
     return;
   }
   const ctx = cliContext(env, option(argv, '--session-id'));
@@ -715,12 +833,35 @@ function runCli(argv, env) {
   if (command === 'status') {
     process.stdout.write(`${JSON.stringify({
       ...checkpoint,
+      ...assessRestore(checkpoint, ctx),
       unseen_delta_paths: unseenDeltaPaths(ctx, checkpoint.semantic_generation || 0, checkpoint),
     }, null, 2)}\n`);
     return;
   }
   if (command === 'show') {
-    process.stdout.write(fs.readFileSync(ctx.markdown, 'utf8'));
+    const generationText = option(argv, '--generation');
+    if (!generationText) {
+      process.stdout.write(fs.readFileSync(ctx.markdown, 'utf8'));
+      return;
+    }
+    const generation = Number.parseInt(generationText, 10);
+    if (!Number.isInteger(generation) || generation < 1) throw new Error('--generation must be a positive integer');
+    const selected = readJson(historyPath(ctx, generation));
+    if (!selected) throw new Error(`generation ${generation} is not retained`);
+    process.stdout.write(renderMarkdown(selected));
+    return;
+  }
+  if (command === 'history') {
+    const history = listHistory(ctx).map((item) => ({
+      generation: item.generation,
+      status: item.status,
+      trigger: item.trigger,
+      delta_bytes: item.transcript_delta?.bytes || 0,
+      semantic_source: item.semantic_source || 'empty',
+      created_at: item.created_at || null,
+      completed_at: item.completed_at || null,
+    }));
+    process.stdout.write(`${JSON.stringify(history, null, 2)}\n`);
     return;
   }
   if (command === 'semantic') {
@@ -755,13 +896,17 @@ function runCli(argv, env) {
 }
 
 function main(argv = process.argv.slice(2), env = process.env) {
-  const cli = ['sessions', 'status', 'show', 'semantic'].includes(argv[0]);
+  const cli = ['sessions', 'status', 'show', 'history', 'semantic'].includes(argv[0]);
   try {
     if (cli) return runCli(argv, env);
     if (env.CONTEXT_CHECKPOINT_HOOK_ACTIVE === '1') return;
     const input = JSON.parse(fs.readFileSync(0, 'utf8'));
-    const output = handleHook(input, env);
-    if (input.hook_event_name === 'SessionStart' && output) {
+    const output = handleHook(input, env, {
+      emitHookOutput(payload) {
+        fs.writeSync(1, `${JSON.stringify(payload)}\n`);
+      },
+    });
+    if (output?.hookSpecificOutput) {
       process.stdout.write(`${JSON.stringify(output)}\n`);
     }
   } catch (error) {

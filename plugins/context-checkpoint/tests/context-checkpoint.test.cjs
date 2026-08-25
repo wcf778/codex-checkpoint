@@ -146,6 +146,7 @@ test('empty mechanical checkpoints are not injected after native compaction', ()
   complete(f);
   const restored = checkpoint.handleHook({ ...f.event('SessionStart'), source: 'compact' }, f.env);
   assert.equal(restored, null);
+  assert.equal(fs.existsSync(checkpoint.resolveContext(f.event('PreCompact'), f.env).recovery), false);
 });
 
 test('semantic restoration keeps every bounded checkpoint section', () => {
@@ -182,6 +183,101 @@ test('semantic restoration allows only the compacted record appended by native c
   assert.equal(checkpoint.handleHook({ ...f.event('SessionStart'), source: 'compact' }, env), null);
 });
 
+test('recovery is delivered exactly once for a compacted root task', () => {
+  const f = fixture();
+  const env = {
+    ...f.env,
+    CONTEXT_CHECKPOINT_SIDECAR_EVERY: '1',
+    CONTEXT_CHECKPOINT_SIDECAR_MIN_BYTES: '1',
+  };
+  checkpoint.handleHook(f.event('PreCompact'), env, {
+    runSidecar() { return { status: 'completed', semantic: semantic('One-shot root') }; },
+  });
+  checkpoint.handleHook(f.event('PostCompact'), env);
+
+  const input = { ...f.event('SessionStart'), source: 'compact' };
+  const first = checkpoint.handleHook(input, env);
+  assert.match(first.hookSpecificOutput.additionalContext, /One-shot root/);
+  assert.equal(checkpoint.handleHook(input, env), null);
+});
+
+test('a failed hook output keeps recovery pending for retry', () => {
+  const f = fixture();
+  const env = {
+    ...f.env,
+    CONTEXT_CHECKPOINT_SIDECAR_EVERY: '1',
+    CONTEXT_CHECKPOINT_SIDECAR_MIN_BYTES: '1',
+  };
+  checkpoint.handleHook(f.event('PreCompact'), env, {
+    runSidecar() { return { status: 'completed', semantic: semantic('Retry delivery') }; },
+  });
+  checkpoint.handleHook(f.event('PostCompact'), env);
+  const input = { ...f.event('SessionStart'), source: 'compact' };
+  assert.throws(() => checkpoint.handleHook(input, env, {
+    emitHookOutput() { throw new Error('broken stdout'); },
+  }), /broken stdout/);
+  assert.ok(fs.existsSync(checkpoint.resolveContext(f.event('PreCompact'), env).recovery));
+  assert.match(checkpoint.handleHook(input, env).hookSpecificOutput.additionalContext, /Retry delivery/);
+});
+
+test('a terminal freshness rejection retires its pending recovery', () => {
+  const f = fixture();
+  const env = {
+    ...f.env,
+    CONTEXT_CHECKPOINT_SIDECAR_EVERY: '1',
+    CONTEXT_CHECKPOINT_SIDECAR_MIN_BYTES: '1',
+  };
+  checkpoint.handleHook(f.event('PreCompact'), env, {
+    runSidecar() { return { status: 'completed', semantic: semantic('Stale delivery') }; },
+  });
+  checkpoint.handleHook(f.event('PostCompact'), env);
+  fs.appendFileSync(f.transcript, '{"newer":true}\n');
+  assert.equal(checkpoint.handleHook(f.event('UserPromptSubmit'), env), null);
+  assert.equal(fs.existsSync(checkpoint.resolveContext(f.event('PreCompact'), env).recovery), false);
+});
+
+test('semantic refresh does not re-arm an already consumed generation', () => {
+  const f = fixture();
+  const env = {
+    ...f.env,
+    CONTEXT_CHECKPOINT_SIDECAR_EVERY: '1',
+    CONTEXT_CHECKPOINT_SIDECAR_MIN_BYTES: '1',
+  };
+  checkpoint.handleHook(f.event('PreCompact'), env, {
+    runSidecar() { return { status: 'completed', semantic: semantic('Initial delivery') }; },
+  });
+  checkpoint.handleHook(f.event('PostCompact'), env);
+  assert.ok(checkpoint.handleHook({ ...f.event('SessionStart'), source: 'compact' }, env));
+
+  const semanticFile = path.join(f.root, 'semantic.json');
+  fs.writeFileSync(semanticFile, JSON.stringify(semantic('Refreshed after delivery')));
+  assert.equal(runCli(f, ['semantic', '--input', semanticFile, '--session-id', 'session-1'], env).status, 0);
+  assert.equal(checkpoint.handleHook(f.event('UserPromptSubmit'), env), null);
+});
+
+test('a compacted subtask falls back to the next user prompt without sharing parent state', () => {
+  const f = fixture();
+  const env = {
+    ...f.env,
+    CONTEXT_CHECKPOINT_SIDECAR_EVERY: '1',
+    CONTEXT_CHECKPOINT_SIDECAR_MIN_BYTES: '1',
+  };
+  const subtask = (name) => ({ ...f.event(name), agent_id: 'agent-1' });
+  checkpoint.handleHook(subtask('PreCompact'), env, {
+    runSidecar() { return { status: 'completed', semantic: semantic('Subtask restore') }; },
+  });
+  checkpoint.handleHook(subtask('PostCompact'), env);
+
+  const parent = checkpoint.resolveContext(f.event('PreCompact'), env);
+  const child = checkpoint.resolveContext(subtask('PreCompact'), env);
+  assert.notEqual(child.sessionDir, parent.sessionDir);
+
+  const prompt = checkpoint.handleHook(subtask('UserPromptSubmit'), env);
+  assert.equal(prompt.hookSpecificOutput.hookEventName, 'UserPromptSubmit');
+  assert.match(prompt.hookSpecificOutput.additionalContext, /Subtask restore/);
+  assert.equal(checkpoint.handleHook(subtask('UserPromptSubmit'), env), null);
+});
+
 test('stale semantic state is never auto-injected', () => {
   const f = fixture();
   complete(f);
@@ -208,6 +304,43 @@ test('manual CLI refuses an ambiguous workspace and accepts an explicit session'
   const explicit = runCli(f, ['status', '--session-id', 'session-a']);
   assert.equal(explicit.status, 0, explicit.stderr);
   assert.equal(JSON.parse(explicit.stdout).session_id, 'session-a');
+});
+
+test('history lists retained generations and show selects one generation', () => {
+  const f = fixture();
+  complete(f, 'turn-1');
+  fs.appendFileSync(f.transcript, '{"turn":2}\n');
+  complete(f, 'turn-2');
+
+  const history = runCli(f, ['history', '--session-id', 'session-1']);
+  assert.equal(history.status, 0, history.stderr);
+  assert.deepEqual(JSON.parse(history.stdout).map((item) => item.generation), [1, 2]);
+  assert.deepEqual(Object.keys(JSON.parse(history.stdout)[0]), [
+    'generation', 'status', 'trigger', 'delta_bytes', 'semantic_source', 'created_at', 'completed_at',
+  ]);
+
+  const shown = runCli(f, ['show', '--generation', '1', '--session-id', 'session-1']);
+  assert.equal(shown.status, 0, shown.stderr);
+  assert.match(shown.stdout, /Generation: 1/);
+});
+
+test('sessions storage reports per-session and workspace byte totals', () => {
+  const f = fixture();
+  complete(f, 'turn-a', 'session-a');
+  complete(f, 'turn-b', 'session-b');
+
+  const result = runCli(f, ['sessions', '--storage']);
+  assert.equal(result.status, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.sessions.length, 2);
+  assert.ok(report.sessions.every((session) => session.stored_bytes > 0));
+  assert.ok(report.sessions.every((session) => typeof session.restore_eligible === 'boolean'));
+  assert.ok(report.sessions.every((session) => typeof session.delta_bytes === 'number'));
+  assert.ok(report.sessions.every((session) => typeof session.semantic_source === 'string'));
+  assert.equal(
+    report.workspace_total_bytes,
+    report.sessions.reduce((total, session) => total + session.stored_bytes, 0),
+  );
 });
 
 test('semantic CLI reports lock contention instead of false success', () => {
@@ -336,6 +469,28 @@ test('status lists every delta unseen by the semantic checkpoint', () => {
   const status = runCli(f, ['status', '--session-id', 'session-1']);
   assert.equal(status.status, 0, status.stderr);
   assert.equal(JSON.parse(status.stdout).unseen_delta_paths.length, 3);
+});
+
+test('status explains whether the current checkpoint can be restored', () => {
+  const f = fixture();
+  complete(f);
+
+  const empty = runCli(f, ['status', '--session-id', 'session-1']);
+  assert.equal(empty.status, 0, empty.stderr);
+  assert.equal(JSON.parse(empty.stdout).restore_eligible, false);
+  assert.equal(JSON.parse(empty.stdout).restore_reason, 'semantic_empty');
+
+  const semanticFile = path.join(f.root, 'semantic.json');
+  fs.writeFileSync(semanticFile, JSON.stringify(semantic('Diagnosable restore')));
+  assert.equal(runCli(f, ['semantic', '--input', semanticFile, '--session-id', 'session-1']).status, 0);
+  const ready = JSON.parse(runCli(f, ['status', '--session-id', 'session-1']).stdout);
+  assert.equal(ready.restore_eligible, true);
+  assert.equal(ready.restore_reason, 'eligible');
+
+  fs.appendFileSync(f.transcript, '{"newer":true}\n');
+  const stale = JSON.parse(runCli(f, ['status', '--session-id', 'session-1']).stdout);
+  assert.equal(stale.restore_eligible, false);
+  assert.equal(stale.restore_reason, 'unexpected_transcript_tail');
 });
 
 test('sidecar skips the duplicated delta from an interrupted generation', () => {

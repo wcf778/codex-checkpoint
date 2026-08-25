@@ -1,6 +1,6 @@
 {
   "name": "context-checkpoint-codex-plugin",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "description": "Deterministic recovery checkpoints around native Codex compaction.",
   "license": "MIT",

@@ -43,6 +43,20 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"const p=require('node:path');require(p.join(process.env.PLUGIN_ROOT??process.env.CLAUDE_PLUGIN_ROOT,'hooks','context-checkpoint.cjs')).main()\"",
+            "commandWindows": "cmd.exe /d /s /c 'call \"%PLUGIN_ROOT%\\hooks\\context-checkpoint.cmd\"'",
+            "timeout": 15,
+            "additionalContextLimit": 2500,
+            "statusMessage": "Restoring context checkpoint..."
+          }
+        ]
+      }
     ]
   }
 }

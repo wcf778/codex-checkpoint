@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/context-checkpoint-logo.png" alt="Context Checkpoint 标志" width="180">
+  <img src="assets/context-checkpoint-logo.svg" alt="Context Checkpoint 标志" width="180">
 </p>
 
 # Context Checkpoint

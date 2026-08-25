@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1000" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="title desc">
+  <title id="title">Context Checkpoint</title>
+  <desc id="desc">Three frosted glass context layers converge into a checkpoint while two colored glass arrows form a recovery loop.</desc>
+  <defs>
+    <linearGradient id="blueGlass" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#dff4ff" stop-opacity=".72"/>
+      <stop offset=".55" stop-color="#70c8ff" stop-opacity=".34"/>
+      <stop offset="1" stop-color="#2f9df4" stop-opacity=".48"/>
+    </linearGradient>
+    <linearGradient id="violetGlass" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f1ecff" stop-opacity=".7"/>
+      <stop offset=".55" stop-color="#bca5ff" stop-opacity=".36"/>
+      <stop offset="1" stop-color="#8d74e8" stop-opacity=".46"/>
+    </linearGradient>
+    <linearGradient id="mintGlass" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#e8fffc" stop-opacity=".72"/>
+      <stop offset=".55" stop-color="#86e2dc" stop-opacity=".34"/>
+      <stop offset="1" stop-color="#48bdb6" stop-opacity=".46"/>
+    </linearGradient>
+    <linearGradient id="coralGlass" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fff0eb" stop-opacity=".74"/>
+      <stop offset=".55" stop-color="#ffb2a0" stop-opacity=".36"/>
+      <stop offset="1" stop-color="#f47d68" stop-opacity=".48"/>
+    </linearGradient>
+    <linearGradient id="cycleGlass" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#61d6dc" stop-opacity=".78"/>
+      <stop offset=".58" stop-color="#8bcbdc" stop-opacity=".66"/>
+      <stop offset="1" stop-color="#ff9b7d" stop-opacity=".78"/>
+    </linearGradient>
+    <linearGradient id="highlight" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff" stop-opacity=".88"/>
+      <stop offset=".55" stop-color="#fff" stop-opacity=".2"/>
+      <stop offset="1" stop-color="#fff" stop-opacity=".48"/>
+    </linearGradient>
+    <filter id="glassShadow" x="-30%" y="-30%" width="160%" height="180%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="16" stdDeviation="18" flood-color="#294663" flood-opacity=".18"/>
+    </filter>
+    <filter id="softShadow" x="-30%" y="-40%" width="160%" height="200%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="10" stdDeviation="11" flood-color="#394c72" flood-opacity=".15"/>
+    </filter>
+    <marker id="violetArrow" markerWidth="2.2" markerHeight="2.2" refX="1.45" refY=".7" orient="auto" markerUnits="strokeWidth" viewBox="0 0 1.4 1.4">
+      <path d="M.08.08 1.32.7.08 1.32Q.36.7.08.08Z" fill="#9b8eea" fill-opacity=".82" stroke="#fff" stroke-opacity=".48" stroke-width=".05" stroke-linejoin="round"/>
+    </marker>
+    <marker id="coralArrow" markerWidth="2.2" markerHeight="2.2" refX="1.45" refY=".7" orient="auto" markerUnits="strokeWidth" viewBox="0 0 1.4 1.4">
+      <path d="M.08.08 1.32.7.08 1.32Q.36.7.08.08Z" fill="#f79478" fill-opacity=".82" stroke="#fff" stroke-opacity=".48" stroke-width=".05" stroke-linejoin="round"/>
+    </marker>
+    <path id="layer" d="M462 0Q500-20 538 0L682 72Q710 86 710 102T682 132L538 204Q500 224 462 204L318 132Q290 118 290 102T318 72Z"/>
+    <style>
+      .edge { vector-effect: non-scaling-stroke; }
+      .frost { opacity: .36; }
+      @media (prefers-color-scheme: dark) {
+        .edge { stroke-opacity: .92; }
+        .frost { opacity: .46; }
+      }
+    </style>
+  </defs>
+
+  <g filter="url(#softShadow)">
+    <path d="M220 270C105 385 90 590 184 724" fill="none" stroke="url(#violetGlass)" stroke-width="58" stroke-linecap="round" marker-end="url(#violetArrow)"/>
+    <path d="M220 270C105 385 90 590 184 724" fill="none" stroke="#fff" stroke-opacity=".34" stroke-width="9" stroke-linecap="round"/>
+    <path d="M816 724C910 590 895 385 780 270" fill="none" stroke="url(#cycleGlass)" stroke-width="58" stroke-linecap="round" marker-end="url(#coralArrow)"/>
+    <path d="M816 724C910 590 895 385 780 270" fill="none" stroke="#fff" stroke-opacity=".34" stroke-width="9" stroke-linecap="round"/>
+  </g>
+
+  <g transform="translate(0 105)" filter="url(#glassShadow)">
+    <use href="#layer" transform="translate(0 18)" fill="#2d93d4" fill-opacity=".18"/>
+    <use href="#layer" fill="url(#blueGlass)" stroke="#67bded" stroke-opacity=".74" stroke-width="5" class="edge"/>
+    <use href="#layer" fill="none" stroke="url(#highlight)" stroke-width="14" stroke-opacity=".55" transform="scale(.96) translate(21 4)" class="edge frost"/>
+  </g>
+  <g transform="translate(0 270)" filter="url(#glassShadow)">
+    <use href="#layer" transform="translate(0 18)" fill="#7b62c7" fill-opacity=".17"/>
+    <use href="#layer" fill="url(#violetGlass)" stroke="#a58ce8" stroke-opacity=".72" stroke-width="5" class="edge"/>
+    <use href="#layer" fill="none" stroke="url(#highlight)" stroke-width="14" stroke-opacity=".52" transform="scale(.96) translate(21 4)" class="edge frost"/>
+  </g>
+  <g transform="translate(0 435)" filter="url(#glassShadow)">
+    <use href="#layer" transform="translate(0 18)" fill="#40a9a5" fill-opacity=".16"/>
+    <use href="#layer" fill="url(#mintGlass)" stroke="#65c9c4" stroke-opacity=".72" stroke-width="5" class="edge"/>
+    <use href="#layer" fill="none" stroke="url(#highlight)" stroke-width="14" stroke-opacity=".52" transform="scale(.96) translate(21 4)" class="edge frost"/>
+  </g>
+
+  <path d="M420 648Q500 690 580 648L528 772Q500 824 472 772Z" fill="url(#mintGlass)" stroke="#fff" stroke-opacity=".46" stroke-width="5" filter="url(#softShadow)"/>
+
+  <g filter="url(#glassShadow)">
+    <path d="M335 785V862C335 910 665 910 665 862V785Z" fill="url(#coralGlass)" stroke="#ef927e" stroke-opacity=".62" stroke-width="5"/>
+    <ellipse cx="500" cy="785" rx="165" ry="76" fill="url(#coralGlass)" stroke="#f09b87" stroke-opacity=".68" stroke-width="6"/>
+    <ellipse cx="500" cy="778" rx="148" ry="62" fill="#fff" fill-opacity=".11" stroke="#fff" stroke-opacity=".5" stroke-width="10" class="frost"/>
+    <path d="M418 788 478 838 590 742" fill="none" stroke="#ff806b" stroke-opacity=".82" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M418 782 478 832 590 736" fill="none" stroke="#fff" stroke-opacity=".48" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

@@ -5,7 +5,7 @@
   "description": "Deterministic recovery checkpoints around native Codex compaction.",
   "license": "MIT",
   "author": "wcf778",
-  "repository": "github:wcf778/context-checkpoint",
+  "repository": "github:wcf778/codex-checkpoint",
   "engines": {
     "node": ">=18"
   },

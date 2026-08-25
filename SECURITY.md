@@ -6,7 +6,7 @@ Security fixes are applied to the latest release and the `main` branch.
 
 ## Reporting a vulnerability
 
-Use [GitHub private vulnerability reporting](https://github.com/wcf778/context-checkpoint/security/advisories/new).
+Use [GitHub private vulnerability reporting](https://github.com/wcf778/codex-checkpoint/security/advisories/new).
 
 Do not attach transcripts, checkpoint state, credentials, private paths, or other sensitive data to a public issue. Include only the minimum redacted reproduction needed to validate the report.
 

@@ -1,41 +1,41 @@
 <p align="center">
-  <img src="assets/context-checkpoint-logo.png" alt="Context Checkpoint logo" width="180">
+  <img src="assets/context-checkpoint-logo.png" alt="Codex Checkpoint logo" width="160">
 </p>
 
-# Context Checkpoint
+<h1 align="center">Codex Checkpoint</h1>
 
-**English** | [简体中文](README.zh-CN.md)
+<p align="center">
+  <strong>English</strong> · <a href="README.zh-CN.md">简体中文</a>
+</p>
 
-[![CI](https://github.com/wcf778/context-checkpoint/actions/workflows/ci.yml/badge.svg)](https://github.com/wcf778/context-checkpoint/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+<p align="center">
+  <a href="https://github.com/wcf778/codex-checkpoint/actions/workflows/ci.yml"><img src="https://github.com/wcf778/codex-checkpoint/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+</p>
 
-**Keep long Codex tasks recoverable across context compaction—without rereading the full transcript or calling another model by default.**
+<p align="center"><strong>Recover long Codex tasks after context compaction—without rereading the full transcript.</strong></p>
 
-Context Checkpoint captures only what changed, marks generations complete only after `PostCompact`, and restores state only when it still belongs to the current session. Native Codex compaction remains the primary semantic compressor.
+<p align="center">Incremental checkpoints, freshness-gated recovery, and no extra model calls by default.</p>
 
 ## The problem
 
-After a long task has crossed several compaction boundaries, its recovery state is difficult to inspect. Repeatedly scanning the full transcript grows with the task, while blindly restoring an old summary risks injecting stale goals, decisions, or next actions.
-
-Context Checkpoint adds a small, deterministic recovery layer around native compaction:
-
-- capture only transcript bytes not already committed;
-- preserve a durable generation history outside the repository;
-- reject restoration when transcript identity or coverage no longer matches;
-- spend no additional model tokens on the default hook path.
+After a long task has crossed several compaction boundaries, its recovery state is difficult to inspect. Repeatedly scanning the full transcript grows with the task, while blindly restoring an old summary risks injecting stale goals, decisions, or next actions. Codex Checkpoint adds a small, deterministic recovery layer while native Codex compaction remains the primary semantic compressor.
 
 ## Before / after
 
-```text
-Native compaction only                 Native compaction + Context Checkpoint
------------------------------------    -----------------------------------------
-Codex compacts semantic context        Codex still compacts semantic context
-No plugin-owned recovery generation    PreCompact captures only unseen bytes
-No durable transcript cursor           PostCompact commits the durable cursor
-No independent freshness gate          SessionStart restores only a fresh match
-```
+**Native compaction only**
 
-## Why Context Checkpoint
+- No plugin-owned recovery generation
+- No durable transcript cursor
+- No independent freshness gate
+
+**With Codex Checkpoint**
+
+- `PreCompact` captures only unseen transcript bytes
+- `PostCompact` commits the completed generation and transcript cursor
+- `SessionStart` restores only when freshness checks pass
+
+## Why Codex Checkpoint
 
 - **Low overhead by default** — deterministic Node.js hooks make no network request and launch no model.
 - **Incremental, not cumulative** — each generation stores only the uncommitted transcript byte range.
@@ -50,10 +50,10 @@ No independent freshness gate          SessionStart restores only a fresh match
 
 The bundled six-generation fixture compares rereading the complete growing transcript at every compaction with capturing each byte once as a delta.
 
-| Strategy | Bytes processed | Difference |
+| Strategy | Input bytes | Change |
 | --- | ---: | ---: |
-| Repeated full-transcript reads | 1,015,521 | baseline |
-| Context Checkpoint deltas | 210,506 | **79.27% fewer bytes** |
+| Full reread | 1,015,521 | baseline |
+| Delta capture | 210,506 | **−79.27%** |
 
 Run it with `npm run benchmark`. This is an input-byte proxy from a synthetic fixture—not a measured token, cost, latency, or task-quality claim. Timings are reported separately because they depend on the machine.
 
@@ -93,11 +93,13 @@ Codex task
 Add this repository as a marketplace, then install the plugin:
 
 ```bash
-codex plugin marketplace add wcf778/context-checkpoint
+codex plugin marketplace add wcf778/codex-checkpoint
 codex plugin add context-checkpoint@context-checkpoint
 ```
 
 Restart Codex, review the command hooks when prompted, and start a new task. Routine compaction then needs no manual action.
+
+The repository and marketplace are named `codex-checkpoint`; the installed plugin id remains `context-checkpoint` for compatibility.
 
 The plugin cannot install project configuration. To use the recommended native compact prompt, merge [`plugins/context-checkpoint/examples/codex-config.toml`](plugins/context-checkpoint/examples/codex-config.toml) into the target repository's `.codex/config.toml`.
 
@@ -111,7 +113,10 @@ $context-checkpoint refresh the current task checkpoint
 
 ## Advanced usage
 
-### Inspect checkpoint state
+<details>
+<summary><strong>Inspect checkpoint state</strong></summary>
+
+<br>
 
 Run these commands from the plugin directory:
 
@@ -124,7 +129,12 @@ node hooks/context-checkpoint.cjs semantic --input checkpoint.json --session-id 
 
 Manual commands refuse to guess when a workspace has multiple sessions.
 
-### Optional semantic sidecar
+</details>
+
+<details>
+<summary><strong>Optional semantic sidecar</strong></summary>
+
+<br>
 
 The sidecar is disabled by default. This example requests a refresh before every third completed compaction when the current delta is at least 32 KiB:
 
@@ -142,6 +152,8 @@ $env:CONTEXT_CHECKPOINT_SIDECAR_MIN_BYTES = '32768'
 
 The child runs with `codex exec --ephemeral --sandbox read-only`, hooks disabled, a minimal environment, and only transcript deltas unseen by the last semantic checkpoint. It cannot browse the target workspace. A sidecar failure never blocks native compaction.
 
+</details>
+
 ## Storage and privacy
 
 - Raw transcript deltas are stored under `PLUGIN_DATA/workspaces/<workspace-id>/context-checkpoint`. If `PLUGIN_DATA` is unavailable, the fallback is under `CODEX_HOME/plugin-data/context-checkpoint`; state is never written to the target repository.
@@ -157,7 +169,10 @@ npm test
 npm run benchmark
 ```
 
-## Repository layout
+<details>
+<summary><strong>Repository layout</strong></summary>
+
+<br>
 
 ```text
 .agents/plugins/marketplace.json       Marketplace entry
@@ -169,6 +184,8 @@ plugins/context-checkpoint/
   tests/                               Lifecycle and failure-mode tests
   bench/                               Input-size benchmark
 ```
+
+</details>
 
 ## Security
 

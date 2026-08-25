@@ -1,41 +1,41 @@
 <p align="center">
-  <img src="assets/context-checkpoint-logo.png" alt="Context Checkpoint 标志" width="180">
+  <img src="assets/context-checkpoint-logo.png" alt="Codex Checkpoint 标志" width="160">
 </p>
 
-# Context Checkpoint
+<h1 align="center">Codex Checkpoint</h1>
 
-[English](README.md) | **简体中文**
+<p align="center">
+  <a href="README.md">English</a> · <strong>简体中文</strong>
+</p>
 
-[![CI](https://github.com/wcf778/context-checkpoint/actions/workflows/ci.yml/badge.svg)](https://github.com/wcf778/context-checkpoint/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+<p align="center">
+  <a href="https://github.com/wcf778/codex-checkpoint/actions/workflows/ci.yml"><img src="https://github.com/wcf778/codex-checkpoint/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+</p>
 
-**让长时间运行的 Codex 任务在上下文压缩后仍可恢复，而不必反复读取完整对话，也不默认调用额外模型。**
+<p align="center"><strong>让长时间运行的 Codex 任务在上下文压缩后仍可恢复，而不必反复读取完整对话。</strong></p>
 
-Context Checkpoint 只捕获新增内容，只在 `PostCompact` 后将 generation 标记为完成，并且仅在状态仍属于当前 session 时恢复。Codex 原生压缩仍负责主要的语义压缩。
+<p align="center">增量检查点、通过新鲜度校验才恢复，默认不调用额外模型。</p>
 
 ## 它解决的问题
 
-长任务经过多次上下文压缩后，恢复状态会变得难以检查。每次重新读取完整 transcript 的处理量会随任务持续增长，而盲目恢复旧摘要又可能重新注入过期的目标、决策或下一步行动。
-
-Context Checkpoint 在原生压缩外围增加一个轻量、确定性的恢复层：
-
-- 只捕获尚未提交的 transcript 字节；
-- 在仓库外保存可追溯的 generation 历史；
-- transcript 身份或覆盖范围不匹配时拒绝恢复；
-- 默认 hook 路径不消耗额外模型 Token。
+长任务经过多次上下文压缩后，恢复状态会变得难以检查。每次重新读取完整 transcript 的处理量会随任务持续增长，而盲目恢复旧摘要又可能重新注入过期的目标、决策或下一步行动。Codex Checkpoint 在原生压缩外围增加一个轻量、确定性的恢复层，Codex 原生压缩仍负责主要的语义压缩。
 
 ## 使用前 / 使用后
 
-```text
-仅使用原生压缩                         原生压缩 + Context Checkpoint
------------------------------------    -----------------------------------------
-Codex 压缩语义上下文                   Codex 仍负责语义压缩
-没有插件维护的恢复 generation          PreCompact 只捕获未处理的新字节
-没有持久化 transcript cursor           PostCompact 提交持久化后的 cursor
-没有独立的新鲜度校验                   SessionStart 只恢复仍然匹配的状态
-```
+**仅使用原生压缩**
 
-## 为什么选择 Context Checkpoint
+- 没有插件维护的恢复 generation
+- 没有持久化 transcript cursor
+- 没有独立的新鲜度校验
+
+**使用 Codex Checkpoint**
+
+- `PreCompact` 只捕获尚未处理的 transcript 字节
+- `PostCompact` 提交已完成的 generation 和 transcript cursor
+- `SessionStart` 仅在通过新鲜度校验后恢复
+
+## 为什么选择 Codex Checkpoint
 
 - **默认开销低** — 确定性的 Node.js hooks 不访问网络，也不启动模型。
 - **增量而非累积** — 每个 generation 只保存尚未提交的 transcript 字节区间。
@@ -50,10 +50,10 @@ Codex 压缩语义上下文                   Codex 仍负责语义压缩
 
 仓库自带的 6-generation fixture 比较两种方式：每次压缩都重新读取不断增长的完整 transcript，以及把每个字节仅作为增量捕获一次。
 
-| 策略 | 处理字节数 | 差异 |
+| 策略 | 输入字节数 | 变化 |
 | --- | ---: | ---: |
-| 重复读取完整 transcript | 1,015,521 | 基线 |
-| Context Checkpoint 增量 | 210,506 | **减少 79.27%** |
+| 完整重读 | 1,015,521 | 基线 |
+| 增量捕获 | 210,506 | **−79.27%** |
 
 运行 `npm run benchmark` 即可复现。这是合成 fixture 的输入字节代理，并非实测 Token、成本、延迟或任务质量。运行时间单独报告，因为它取决于具体机器。
 
@@ -93,11 +93,13 @@ Codex 任务
 先将本仓库添加为 marketplace，再安装插件：
 
 ```bash
-codex plugin marketplace add wcf778/context-checkpoint
+codex plugin marketplace add wcf778/codex-checkpoint
 codex plugin add context-checkpoint@context-checkpoint
 ```
 
 重启 Codex，在提示时审查并批准 command hooks，然后新建任务。之后的日常压缩不需要手动操作。
+
+仓库和 marketplace 名称为 `codex-checkpoint`；为保持兼容，安装后的插件 id 仍为 `context-checkpoint`。
 
 插件不能自动安装项目配置。若要使用推荐的原生压缩提示词，请将 [`plugins/context-checkpoint/examples/codex-config.toml`](plugins/context-checkpoint/examples/codex-config.toml) 合并到目标仓库的 `.codex/config.toml`。
 
@@ -111,7 +113,10 @@ $context-checkpoint 刷新当前任务检查点
 
 ## 高级用法
 
-### 检查 checkpoint 状态
+<details>
+<summary><strong>检查 checkpoint 状态</strong></summary>
+
+<br>
 
 在插件目录运行：
 
@@ -124,7 +129,12 @@ node hooks/context-checkpoint.cjs semantic --input checkpoint.json --session-id 
 
 同一工作区存在多个 session 时，手动命令会要求明确指定 `--session-id`，不会自行猜测。
 
-### 可选语义 sidecar
+</details>
+
+<details>
+<summary><strong>可选语义 sidecar</strong></summary>
+
+<br>
 
 Sidecar 默认关闭。下面的配置会在每 3 次完成的压缩前检查一次，并仅在当前增量至少为 32 KiB 时刷新：
 
@@ -142,6 +152,8 @@ $env:CONTEXT_CHECKPOINT_SIDECAR_MIN_BYTES = '32768'
 
 子进程使用 `codex exec --ephemeral --sandbox read-only`，禁用 hooks，只接收最小环境和上次语义检查点之后尚未处理的 transcript 增量，且不能浏览目标工作区。Sidecar 失败不会阻塞原生压缩。
 
+</details>
+
 ## 存储与隐私
 
 - 原始 transcript 增量保存在 `PLUGIN_DATA/workspaces/<workspace-id>/context-checkpoint`。如果没有 `PLUGIN_DATA`，则回退到 `CODEX_HOME/plugin-data/context-checkpoint`；状态不会写入目标仓库。
@@ -157,7 +169,10 @@ npm test
 npm run benchmark
 ```
 
-## 仓库结构
+<details>
+<summary><strong>仓库结构</strong></summary>
+
+<br>
 
 ```text
 .agents/plugins/marketplace.json       Marketplace 入口
@@ -169,6 +184,8 @@ plugins/context-checkpoint/
   tests/                               生命周期和故障模式测试
   bench/                               输入规模 Benchmark
 ```
+
+</details>
 
 ## 安全
 

@@ -1,7 +1,7 @@
 {
   "name": "context-checkpoint",
   "interface": {
-    "displayName": "Context Checkpoint"
+    "displayName": "Codex Checkpoint"
   },
   "plugins": [
     {

@@ -6,13 +6,13 @@
     "name": "wcf778",
     "url": "https://github.com/wcf778"
   },
-  "homepage": "https://github.com/wcf778/context-checkpoint#readme",
-  "repository": "https://github.com/wcf778/context-checkpoint",
+  "homepage": "https://github.com/wcf778/codex-checkpoint#readme",
+  "repository": "https://github.com/wcf778/codex-checkpoint",
   "license": "MIT",
   "keywords": ["codex", "context", "compaction", "checkpoint"],
   "skills": "./skills/",
   "interface": {
-    "displayName": "Context Checkpoint",
+    "displayName": "Codex Checkpoint",
     "shortDescription": "Preserve current task state across compaction.",
     "longDescription": "Records transcript deltas and workspace state around Codex compaction, then restores a concise task checkpoint.",
     "developerName": "wcf778",

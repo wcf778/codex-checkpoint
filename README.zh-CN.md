@@ -9,33 +9,86 @@
 [![CI](https://github.com/wcf778/context-checkpoint/actions/workflows/ci.yml/badge.svg)](https://github.com/wcf778/context-checkpoint/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-一个面向 Codex 的低 Token 上下文检查点插件，在原生上下文压缩前后记录确定性的恢复状态。
+**让长时间运行的 Codex 任务在上下文压缩后仍可恢复，而不必反复读取完整对话，也不默认调用额外模型。**
 
-Codex 原生压缩仍负责主要的语义压缩。本插件只增加可恢复的任务状态层，默认不会额外启动模型。
+Context Checkpoint 只捕获新增内容，只在 `PostCompact` 后将 generation 标记为完成，并且仅在状态仍属于当前 session 时恢复。Codex 原生压缩仍负责主要的语义压缩。
 
-## 功能
+## 它解决的问题
 
-- `PreCompact` 仅保存尚未提交的 transcript 字节增量和轻量 Git 状态标记。
-- `PostCompact` 在检查点持久化后提交 generation 和 transcript cursor。
-- `SessionStart(source=compact)` 仅在 transcript 身份与覆盖范围仍匹配时恢复结构化语义检查点。
-- `$context-checkpoint` 可在任务交接点刷新目标、约束、决策、进度、失败经验、开放问题和下一步行动。
-- 可选的只读 sidecar 能每隔 _N_ 次完成的压缩刷新一次语义状态；默认关闭。
+长任务经过多次上下文压缩后，恢复状态会变得难以检查。每次重新读取完整 transcript 的处理量会随任务持续增长，而盲目恢复旧摘要又可能重新注入过期的目标、决策或下一步行动。
+
+Context Checkpoint 在原生压缩外围增加一个轻量、确定性的恢复层：
+
+- 只捕获尚未提交的 transcript 字节；
+- 在仓库外保存可追溯的 generation 历史；
+- transcript 身份或覆盖范围不匹配时拒绝恢复；
+- 默认 hook 路径不消耗额外模型 Token。
+
+## 使用前 / 使用后
+
+```text
+仅使用原生压缩                         原生压缩 + Context Checkpoint
+-----------------------------------    -----------------------------------------
+Codex 压缩语义上下文                   Codex 仍负责语义压缩
+没有插件维护的恢复 generation          PreCompact 只捕获未处理的新字节
+没有持久化 transcript cursor           PostCompact 提交持久化后的 cursor
+没有独立的新鲜度校验                   SessionStart 只恢复仍然匹配的状态
+```
+
+## 为什么选择 Context Checkpoint
+
+- **默认开销低** — 确定性的 Node.js hooks 不访问网络，也不启动模型。
+- **增量而非累积** — 每个 generation 只保存尚未提交的 transcript 字节区间。
+- **通过新鲜度校验才恢复** — 被替换、重写、过期或不匹配的 transcript 不会自动注入。
+- **故障安全的生命周期** — completed-generation 计数和已提交的 transcript cursor 只在 `PostCompact` 阶段推进。
+- **不污染目标仓库** — 状态保存在 Codex/plugin data 下，不写入目标工作区。
+- **按需刷新语义** — 手动 Skill 和可选只读 sidecar 可保存有边界的任务语义。
+
+## 效果与证据
+
+### 可复现的输入规模 Benchmark
+
+仓库自带的 6-generation fixture 比较两种方式：每次压缩都重新读取不断增长的完整 transcript，以及把每个字节仅作为增量捕获一次。
+
+| 策略 | 处理字节数 | 差异 |
+| --- | ---: | ---: |
+| 重复读取完整 transcript | 1,015,521 | 基线 |
+| Context Checkpoint 增量 | 210,506 | **减少 79.27%** |
+
+运行 `npm run benchmark` 即可复现。这是合成 fixture 的输入字节代理，并非实测 Token、成本、延迟或任务质量。运行时间单独报告，因为它取决于具体机器。
+
+### 生命周期与故障模式覆盖
+
+仓库包含 **25 个自动化测试**，覆盖锁所有权、幂等性、transcript 替换与原地重写检测、过期状态拒绝、原子元数据更新、保留策略、sidecar 隔离、递归保护、CLI session 歧义、Windows 启动器和有界 Schema 校验。
+
+```bash
+cd plugins/context-checkpoint
+npm test
+```
+
+测试和 Benchmark 是可公开复现的证据。真实宿主 smoke run 用于验证集成行为，但不作为跨机器性能数据。
+
+## 工作原理
 
 ```text
 Codex 任务
-  -> PreCompact：确定性增量 + 工作区状态标记
+  -> PreCompact：捕获确定性增量 + 工作区状态标记
   -> 原生 compact：主要语义压缩
-  -> PostCompact：持久化 generation 提交
-  -> SessionStart(compact)：通过新鲜度校验后恢复检查点
+  -> PostCompact：提交 generation + transcript cursor
+  -> SessionStart(compact)：仅在通过新鲜度校验后恢复
 ```
 
-## 环境要求
+`$context-checkpoint` 还能按需刷新有边界的语义记录，包括目标、约束、决策、进度、失败经验、开放问题和下一步行动。
+
+## 快速开始
+
+### 环境要求
 
 - 支持命令型生命周期 hooks 和插件机制的 Codex
 - Node.js 18 或更高版本
 - Git 可选；非 Git 工作区使用稳定路径身份代替 Git 状态标记
 
-## 安装
+### 安装
 
 先将本仓库添加为 marketplace，再安装插件：
 
@@ -44,19 +97,23 @@ codex plugin marketplace add wcf778/context-checkpoint
 codex plugin add context-checkpoint@context-checkpoint
 ```
 
-重启 Codex，在提示时审查并批准 command hooks，然后新建任务。
+重启 Codex，在提示时审查并批准 command hooks，然后新建任务。之后的日常压缩不需要手动操作。
 
 插件不能自动安装项目配置。若要使用推荐的原生压缩提示词，请将 [`plugins/context-checkpoint/examples/codex-config.toml`](plugins/context-checkpoint/examples/codex-config.toml) 合并到目标仓库的 `.codex/config.toml`。
 
 ## 使用
 
-日常自动压缩不需要手动操作。需要显式刷新语义状态时，可输入：
+需要在交接点或阶段边界显式刷新语义状态时，可输入：
 
 ```text
 $context-checkpoint 刷新当前任务检查点
 ```
 
-也可以在插件目录运行检查命令：
+## 高级用法
+
+### 检查 checkpoint 状态
+
+在插件目录运行：
 
 ```bash
 node hooks/context-checkpoint.cjs sessions
@@ -67,7 +124,7 @@ node hooks/context-checkpoint.cjs semantic --input checkpoint.json --session-id 
 
 同一工作区存在多个 session 时，手动命令会要求明确指定 `--session-id`，不会自行猜测。
 
-## 可选 sidecar
+### 可选语义 sidecar
 
 Sidecar 默认关闭。下面的配置会在每 3 次完成的压缩前检查一次，并仅在当前增量至少为 32 KiB 时刷新：
 
@@ -100,8 +157,6 @@ npm test
 npm run benchmark
 ```
 
-Benchmark 分别比较重复读取完整 transcript 与增量捕获的耗时。报告的字节减少比例只是输入规模代理，不代表真实 Token 成本或任务质量。
-
 ## 仓库结构
 
 ```text
@@ -110,14 +165,14 @@ plugins/context-checkpoint/
   .codex-plugin/plugin.json            插件清单
   hooks/                               命令 hooks 与状态机
   skills/context-checkpoint/           手动语义刷新 Skill
-  schemas/                             结构化检查点 Schema
-  tests/                               生命周期和失败模式测试
+  schemas/                             结构化 checkpoint Schema
+  tests/                               生命周期和故障模式测试
   bench/                               输入规模 Benchmark
 ```
 
 ## 安全
 
-报告漏洞前请阅读 [`SECURITY.md`](SECURITY.md)。请勿在公开 Issue 中附加 transcript、检查点状态、凭据或其他隐私数据。
+报告漏洞前请阅读 [`SECURITY.md`](SECURITY.md)。请勿在公开 Issue 中附加 transcript、checkpoint 状态、凭据或其他隐私数据。
 
 ## 许可证
 

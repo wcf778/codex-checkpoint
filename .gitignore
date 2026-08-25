@@ -1,0 +1,10 @@
+work/
+outputs/
+node_modules/
+coverage/
+.codex/context-checkpoint/
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "goal",
+    "acceptance_criteria",
+    "constraints",
+    "decisions",
+    "current_progress",
+    "negative_knowledge",
+    "open_questions",
+    "next_actions"
+  ],
+  "properties": {
+    "goal": {"type": "string", "maxLength": 200},
+    "acceptance_criteria": {"$ref": "#/$defs/items"},
+    "constraints": {"$ref": "#/$defs/items"},
+    "decisions": {"$ref": "#/$defs/items"},
+    "current_progress": {"$ref": "#/$defs/items"},
+    "negative_knowledge": {"$ref": "#/$defs/items"},
+    "open_questions": {"$ref": "#/$defs/items"},
+    "next_actions": {"$ref": "#/$defs/items"}
+  },
+  "$defs": {
+    "items": {
+      "type": "array",
+      "maxItems": 3,
+      "items": {"type": "string", "maxLength": 50}
+    }
+  }
+}

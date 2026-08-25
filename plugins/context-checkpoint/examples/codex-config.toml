@@ -1,0 +1,9 @@
+compact_prompt = """
+Compact the conversation into the smallest state that can continue the current task correctly.
+Preserve: current goal and acceptance criteria; active constraints and authorization boundaries; decisions with reasons; verified evidence and exact paths; current progress; failed approaches only as concise do-not-retry knowledge; unresolved questions; and the exact next action.
+Discard: raw or repeated logs, superseded plans, obsolete assumptions, resolved questions, repeated explanations, and unrelated history.
+Keep runtime completion separate from validation. Mark partial, blocked, not run, and not validated states explicitly. Do not invent results or silently revive an abandoned approach.
+"""
+
+[features]
+hooks = true

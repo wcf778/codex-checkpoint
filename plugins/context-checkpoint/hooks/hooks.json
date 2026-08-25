@@ -1,0 +1,48 @@
+{
+  "description": "Deterministic context checkpoints around Codex compaction.",
+  "hooks": {
+    "PreCompact": [
+      {
+        "matcher": "^(auto|manual)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"const p=require('node:path');require(p.join(process.env.PLUGIN_ROOT??process.env.CLAUDE_PLUGIN_ROOT,'hooks','context-checkpoint.cjs')).main()\"",
+            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\context-checkpoint.cmd\"",
+            "timeout": 180,
+            "statusMessage": "Saving context checkpoint..."
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "matcher": "^(auto|manual)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"const p=require('node:path');require(p.join(process.env.PLUGIN_ROOT??process.env.CLAUDE_PLUGIN_ROOT,'hooks','context-checkpoint.cjs')).main()\"",
+            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\context-checkpoint.cmd\"",
+            "timeout": 15,
+            "statusMessage": "Finalizing context checkpoint..."
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "^compact$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"const p=require('node:path');require(p.join(process.env.PLUGIN_ROOT??process.env.CLAUDE_PLUGIN_ROOT,'hooks','context-checkpoint.cjs')).main()\"",
+            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\context-checkpoint.cmd\"",
+            "timeout": 15,
+            "additionalContextLimit": 2500,
+            "statusMessage": "Restoring context checkpoint..."
+          }
+        ]
+      }
+    ]
+  }
+}

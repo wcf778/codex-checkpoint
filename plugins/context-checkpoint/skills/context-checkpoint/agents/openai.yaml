@@ -1,0 +1,6 @@
+interface:
+  display_name: "Context Checkpoint"
+  short_description: "Refresh task state before compaction or handoff."
+  default_prompt: "$context-checkpoint -- Refresh the current task checkpoint from all unseen deltas."
+policy:
+  allow_implicit_invocation: false

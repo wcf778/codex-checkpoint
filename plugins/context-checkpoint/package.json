@@ -1,0 +1,17 @@
+{
+  "name": "context-checkpoint-codex-plugin",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Deterministic recovery checkpoints around native Codex compaction.",
+  "license": "MIT",
+  "author": "wcf778",
+  "repository": "github:wcf778/context-checkpoint",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test tests/context-checkpoint.test.cjs",
+    "benchmark": "node bench/benchmark.cjs",
+    "check": "npm test && npm run benchmark"
+  }
+}

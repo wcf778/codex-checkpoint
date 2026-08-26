@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
@@ -37,7 +38,11 @@ function fixture(content = '{"turn":1}\n') {
   const git = spawnSync('git', ['init', '-q'], { cwd: workspace, encoding: 'utf8' });
   assert.equal(git.status, 0, git.stderr);
   fs.writeFileSync(transcript, content);
-  const env = { ...process.env, CONTEXT_CHECKPOINT_DATA_DIR: data };
+  const env = {
+    ...process.env,
+    CONTEXT_CHECKPOINT_DATA_DIR: data,
+    CONTEXT_CHECKPOINT_SIDECAR_EVERY: '0',
+  };
   function event(name, turn = 'turn-1', session = 'session-1', cwd = workspace) {
     return {
       session_id: session,
@@ -164,7 +169,7 @@ test('semantic restoration keeps every bounded checkpoint section', () => {
   assert.doesNotMatch(restored.hookSpecificOutput.additionalContext, /Generation|Workspace|Transcript|Semantic source/);
 });
 
-test('restore payload preserves every field in the maximum valid semantic checkpoint', () => {
+test('the maximum schema-valid multibyte semantic checkpoint remains restorable', () => {
   const f = fixture();
   complete(f);
   const semanticFile = path.join(f.root, 'semantic.json');
@@ -179,14 +184,14 @@ test('restore payload preserves every field in the maximum valid semantic checkp
     next_actions: '行',
   };
   for (const [key, character] of Object.entries(characters)) {
-    value[key] = [1, 2, 3].map((index) => `${character.repeat(25)}${index}`);
+    value[key] = [1, 2, 3].map((index) => `${character.repeat(79)}${index}`);
   }
   fs.writeFileSync(semanticFile, JSON.stringify(value));
   assert.equal(runCli(f, ['semantic', '--input', semanticFile, '--thread-id', 'session-1']).status, 0);
 
   const restored = checkpoint.handleHook({ ...f.event('SessionStart'), source: 'compact' }, f.env);
   const payload = restored.hookSpecificOutput.additionalContext;
-  assert.ok(Buffer.byteLength(payload, 'utf8') <= 2500);
+  assert.ok(Buffer.byteLength(payload, 'utf8') > 2500);
   assert.match(payload, /## Goal/);
   assert.ok(payload.includes(value.goal));
   for (const items of Object.values(value).filter(Array.isArray)) {
@@ -199,32 +204,37 @@ test('restore payload preserves every field in the maximum valid semantic checkp
   assert.doesNotMatch(payload, /Generation|Workspace|Transcript|Semantic source/);
 });
 
-test('an oversized legacy semantic payload is diagnosed and not restored', () => {
+test('show-context prints the exact restore payload in execution order', () => {
   const f = fixture();
   complete(f);
-  const ctx = checkpoint.resolveContext(f.event('PreCompact'), f.env);
-  const current = JSON.parse(fs.readFileSync(ctx.current, 'utf8'));
-  const meta = JSON.parse(fs.readFileSync(ctx.meta, 'utf8'));
-  current.semantic = { ...checkpoint.emptySemantic(), goal: '目'.repeat(200) };
-  for (const key of Object.keys(current.semantic).filter((key) => Array.isArray(current.semantic[key]))) {
-    current.semantic[key] = new Array(3).fill('验'.repeat(50));
-  }
-  current.semantic_generation = current.generation;
-  current.semantic_source = 'legacy';
-  current.semantic_transcript = {
-    path: meta.cursor.path,
-    end_offset: meta.cursor.offset,
-    source_identity: meta.cursor.source_identity,
-  };
-  fs.writeFileSync(ctx.current, `${JSON.stringify(current, null, 2)}\n`);
+  const semanticFile = path.join(f.root, 'semantic.json');
+  const value = semantic('Inspect recovery payload');
+  value.open_questions = ['Keep unknown facts unknown.'];
+  fs.writeFileSync(semanticFile, JSON.stringify(value));
+  assert.equal(runCli(f, ['semantic', '--input', semanticFile, '--thread-id', 'session-1']).status, 0);
 
-  const status = JSON.parse(runCli(f, ['status', '--thread-id', 'session-1']).stdout);
-  assert.equal(status.restore_eligible, false);
-  assert.equal(status.restore_reason, 'semantic_payload_too_large');
-  assert.equal(checkpoint.handleHook({ ...f.event('SessionStart'), source: 'compact' }, f.env), null);
+  const shown = runCli(f, ['show-context', '--thread-id', 'session-1']);
+  assert.equal(shown.status, 0, shown.stderr);
+  assert.equal(shown.stdout, checkpoint.renderRestoreContext(readCurrent(f)));
+  const headings = [
+    'Goal', 'Constraints', 'Do not retry', 'Acceptance criteria',
+    'Next actions', 'Current progress', 'Decisions', 'Open questions',
+  ];
+  assert.deepEqual(
+    [...shown.stdout.matchAll(/^## (.+)$/gm)].map((match) => match[1]),
+    headings,
+  );
+  assert.doesNotMatch(shown.stdout, /Generation|Workspace|Transcript|Semantic source/);
+  const diagnostic = runCli(f, ['show', '--thread-id', 'session-1']);
+  assert.match(diagnostic.stdout, /Semantic source: manual/);
+  assert.match(diagnostic.stdout, /Semantic verification: unreviewed/);
+  const legacy = semantic('Legacy duplicate state');
+  legacy.constraints = ['Keep one exact item.', 'Keep one exact item.'];
+  assert.equal(checkpoint.renderRestoreContext({ semantic: legacy })
+    .match(/^- Keep one exact item\.$/gm).length, 1);
 });
 
-test('restore freshness does not depend on internal transcript record types', () => {
+test('SessionStart trusts a same-source append without parsing transcript records', () => {
   const f = fixture();
   const env = {
     ...f.env,
@@ -234,13 +244,16 @@ test('restore freshness does not depend on internal transcript record types', ()
   checkpoint.handleHook(f.event('PreCompact'), env, {
     runSidecar() { return { status: 'completed', semantic: semantic('Fresh compact goal') }; },
   });
-  fs.appendFileSync(f.transcript, `${JSON.stringify({ type: 'future_record_name', payload: {} })}\n`);
   checkpoint.handleHook(f.event('PostCompact'), env);
+  fs.appendFileSync(f.transcript, 'opaque-host-tail\n');
+  const status = JSON.parse(runCli(f, ['status', '--thread-id', 'session-1'], env).stdout);
+  assert.equal(status.restore_reason, 'unexpected_transcript_tail');
   const restored = checkpoint.handleHook({ ...f.event('SessionStart'), source: 'compact' }, env);
   assert.match(restored.hookSpecificOutput.additionalContext, /Fresh compact goal/);
+  assert.equal(checkpoint.handleHook({ ...f.event('SessionStart'), source: 'compact' }, env), null);
 });
 
-test('any transcript append after PostCompact makes recovery stale', () => {
+test('the first observed UserPromptSubmit trusts a same-source append', () => {
   const f = fixture();
   const env = {
     ...f.env,
@@ -251,8 +264,10 @@ test('any transcript append after PostCompact makes recovery stale', () => {
     runSidecar() { return { status: 'completed', semantic: semantic('Fresh compact goal') }; },
   });
   checkpoint.handleHook(f.event('PostCompact'), env);
-  fs.appendFileSync(f.transcript, `${JSON.stringify({ type: 'message', payload: {} })}\n`);
-  assert.equal(checkpoint.handleHook({ ...f.event('SessionStart'), source: 'compact' }, env), null);
+  fs.appendFileSync(f.transcript, 'opaque-prompt-tail\n');
+  const restored = checkpoint.handleHook(f.event('UserPromptSubmit', 'prompt-turn'), env);
+  assert.match(restored.hookSpecificOutput.additionalContext, /Fresh compact goal/);
+  assert.equal(checkpoint.handleHook(f.event('UserPromptSubmit', 'later-turn'), env), null);
 });
 
 test('same-path transcript replacement after PostCompact makes recovery stale', () => {
@@ -330,7 +345,49 @@ test('one-shot recovery consumes a compacted root checkpoint after local output 
   assert.equal(checkpoint.handleHook(input, env), null);
 });
 
-test('one-shot recovery retries a host lifecycle tail after local output failure', () => {
+test('a delivered recovery repairs an interrupted success receipt without reinjection', () => {
+  const f = fixture();
+  const env = {
+    ...f.env,
+    CONTEXT_CHECKPOINT_SIDECAR_EVERY: '1',
+    CONTEXT_CHECKPOINT_SIDECAR_MIN_BYTES: '1',
+  };
+  checkpoint.handleHook(f.event('PreCompact'), env, {
+    runSidecar() { return { status: 'completed', semantic: semantic('Repair success receipt') }; },
+  });
+  checkpoint.handleHook(f.event('PostCompact'), env);
+  const ctx = checkpoint.resolveContext(f.event('PreCompact'), env);
+  const rename = fs.renameSync;
+  let metaWrites = 0;
+  fs.renameSync = (source, target) => {
+    if (target === ctx.meta && ++metaWrites === 2) throw new Error('injected receipt crash');
+    return rename(source, target);
+  };
+  let outputs = 0;
+  try {
+    assert.throws(() => checkpoint.handleHook(f.event('UserPromptSubmit', 'prompt-turn'), env, {
+      emitHookOutput() { outputs += 1; },
+    }), /injected receipt crash/);
+  } finally {
+    fs.renameSync = rename;
+  }
+  assert.equal(outputs, 1);
+  assert.equal(JSON.parse(fs.readFileSync(ctx.current, 'utf8')).recovery_state, 'delivered');
+  assert.equal(JSON.parse(fs.readFileSync(ctx.meta, 'utf8')).last_recovery_delivery.status, 'attempting');
+
+  assert.equal(checkpoint.handleHook(f.event('UserPromptSubmit', 'later-turn'), env), null);
+  const receipt = JSON.parse(fs.readFileSync(ctx.meta, 'utf8')).last_recovery_delivery;
+  assert.equal(receipt.status, 'local_output_succeeded');
+  assert.match(receipt.local_output_succeeded_at, /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(
+    receipt.local_output_succeeded_at,
+    JSON.parse(fs.readFileSync(ctx.current, 'utf8')).recovery_delivered_at,
+  );
+  assert.equal(outputs, 1);
+  assert.equal(fs.existsSync(ctx.recovery), false);
+});
+
+test('one-shot recovery retries a same-source append after local output failure', () => {
   const f = fixture();
   const env = {
     ...f.env,
@@ -341,16 +398,7 @@ test('one-shot recovery retries a host lifecycle tail after local output failure
     runSidecar() { return { status: 'completed', semantic: semantic('Retry delivery') }; },
   });
   checkpoint.handleHook(f.event('PostCompact'), env);
-  fs.appendFileSync(f.transcript, ['task_complete', 'thread_settings_applied', 'task_started']
-    .map((type) => `${JSON.stringify({
-      type: 'event_msg',
-      payload: {
-        type,
-        ...(type === 'task_complete' ? { turn_id: 'turn-1' } : {}),
-        ...(type === 'task_started' ? { turn_id: 'retry-turn' } : {}),
-      },
-    })}\n`)
-    .join(''));
+  fs.appendFileSync(f.transcript, 'opaque-host-tail\n');
   const input = { ...f.event('SessionStart'), source: 'compact' };
   assert.throws(() => checkpoint.handleHook(input, env, {
     emitHookOutput() { throw new Error('broken stdout'); },
@@ -377,7 +425,7 @@ test('one-shot recovery retries a host lifecycle tail after local output failure
   assert.equal(fs.existsSync(ctx.recovery), false);
 });
 
-test('SessionStart defers a noisy postcompact tail to the first matching user prompt', () => {
+test('SessionStart accepts a large opaque postcompact tail', () => {
   const f = fixture();
   const env = {
     ...f.env,
@@ -388,66 +436,38 @@ test('SessionStart defers a noisy postcompact tail to the first matching user pr
     runSidecar() { return { status: 'completed', semantic: semantic('Prompt fallback') }; },
   });
   checkpoint.handleHook(f.event('PostCompact'), env);
-  fs.appendFileSync(f.transcript, [
-    { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-1' } },
-    {
-      type: 'event_msg',
-      payload: {
-        type: 'item_completed',
-        turn_id: 'older-turn',
-        item: { type: 'SubAgentActivity', id: 'subagent-completed-1' },
-      },
-    },
-    {
-      type: 'event_msg',
-      payload: {
-        type: 'item_completed',
-        turn_id: 'older-turn',
-        item: { type: 'SubAgentActivity', id: 'subagent-completed-2' },
-      },
-    },
-    { type: 'event_msg', payload: { type: 'thread_settings_applied' } },
-    { type: 'event_msg', payload: { type: 'task_started', turn_id: 'prompt-turn' } },
-    { type: 'response_item', payload: { type: 'message', role: 'developer', content: 'x'.repeat(70 * 1024) } },
-    { type: 'response_item', payload: { type: 'message', role: 'user', content: 'continue' } },
-  ].map((record) => `${JSON.stringify(record)}\n`).join(''));
+  fs.appendFileSync(f.transcript, 'x'.repeat(70 * 1024));
 
   const status = JSON.parse(runCli(f, ['status', '--thread-id', 'session-1'], env).stdout);
   assert.equal(status.restore_reason, 'unexpected_transcript_tail');
   const ctx = checkpoint.resolveContext(f.event('PreCompact'), env);
-  assert.equal(checkpoint.handleHook({ ...f.event('SessionStart'), source: 'compact' }, env), null);
-  assert.ok(fs.existsSync(ctx.recovery));
-  const restored = checkpoint.handleHook(f.event('UserPromptSubmit', 'prompt-turn'), env);
+  const restored = checkpoint.handleHook({ ...f.event('SessionStart'), source: 'compact' }, env);
   assert.match(restored.hookSpecificOutput.additionalContext, /Prompt fallback/);
   const receipt = JSON.parse(fs.readFileSync(ctx.meta, 'utf8')).last_recovery_delivery;
-  assert.equal(receipt.event, 'UserPromptSubmit');
+  assert.equal(receipt.event, 'SessionStart');
   assert.equal(receipt.attempt_count, 1);
   assert.equal(fs.existsSync(ctx.recovery), false);
   assert.equal(checkpoint.handleHook(f.event('UserPromptSubmit', 'later-turn'), env), null);
 });
 
-test('postcompact user prompt recovery requires an explicit matching turn id', () => {
-  for (const [startedTurn, promptTurn] of [['first-turn', 'later-turn'], [undefined, undefined]]) {
-    const f = fixture();
-    const env = {
-      ...f.env,
-      CONTEXT_CHECKPOINT_SIDECAR_EVERY: '1',
-      CONTEXT_CHECKPOINT_SIDECAR_MIN_BYTES: '1',
-    };
-    checkpoint.handleHook(f.event('PreCompact'), env, {
-      runSidecar() { return { status: 'completed', semantic: semantic('Do not restore') }; },
-    });
-    checkpoint.handleHook(f.event('PostCompact'), env);
-    fs.appendFileSync(f.transcript, [
-      { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-1' } },
-      { type: 'event_msg', payload: { type: 'thread_settings_applied' } },
-      { type: 'event_msg', payload: { type: 'task_started', turn_id: startedTurn } },
-    ].map((record) => `${JSON.stringify(record)}\n`).join(''));
+test('postcompact user prompt recovery requires an explicit turn id', () => {
+  const f = fixture();
+  const env = {
+    ...f.env,
+    CONTEXT_CHECKPOINT_SIDECAR_EVERY: '1',
+    CONTEXT_CHECKPOINT_SIDECAR_MIN_BYTES: '1',
+  };
+  checkpoint.handleHook(f.event('PreCompact'), env, {
+    runSidecar() { return { status: 'completed', semantic: semantic('Do not restore') }; },
+  });
+  checkpoint.handleHook(f.event('PostCompact'), env);
+  fs.appendFileSync(f.transcript, 'opaque-prompt-tail\n');
 
-    const input = { ...f.event('UserPromptSubmit', promptTurn), turn_id: promptTurn };
-    assert.equal(checkpoint.handleHook(input, env), null);
-    assert.equal(fs.existsSync(checkpoint.resolveContext(f.event('PreCompact'), env).recovery), false);
-  }
+  const input = { ...f.event('UserPromptSubmit'), turn_id: undefined };
+  assert.equal(checkpoint.handleHook(input, env), null);
+  const ctx = checkpoint.resolveContext(f.event('PreCompact'), env);
+  assert.equal(JSON.parse(fs.readFileSync(ctx.current, 'utf8')).recovery_state, 'retired');
+  assert.equal(fs.existsSync(ctx.recovery), false);
 });
 
 test('root SessionStart compact finalizes a missing PostCompact before recovery', () => {
@@ -477,6 +497,135 @@ test('root SessionStart compact finalizes a missing PostCompact before recovery'
   });
   assert.equal(JSON.parse(fs.readFileSync(ctx.meta, 'utf8')).completed_generations, 1);
   assert.equal(checkpoint.handleHook({ ...f.event('SessionStart'), source: 'compact' }, env), null);
+});
+
+test('a completed checkpoint repairs metadata after an interrupted state write', () => {
+  const f = fixture();
+  const env = {
+    ...f.env,
+    CONTEXT_CHECKPOINT_SIDECAR_EVERY: '1',
+    CONTEXT_CHECKPOINT_SIDECAR_MIN_BYTES: '1',
+  };
+  checkpoint.handleHook(f.event('PreCompact'), env, {
+    runSidecar() { return { status: 'completed', semantic: semantic('Repair state crash') }; },
+  });
+  const ctx = checkpoint.resolveContext(f.event('PreCompact'), env);
+  const rename = fs.renameSync;
+  fs.renameSync = (source, target) => {
+    if (target === ctx.meta) throw new Error('injected state crash');
+    return rename(source, target);
+  };
+  try {
+    assert.throws(() => checkpoint.handleHook(f.event('PostCompact'), env), /injected state crash/);
+  } finally {
+    fs.renameSync = rename;
+  }
+
+  assert.equal(JSON.parse(fs.readFileSync(ctx.current, 'utf8')).status, 'complete');
+  assert.equal(fs.existsSync(ctx.recovery), false);
+  fs.unlinkSync(ctx.markdown);
+  fs.unlinkSync(path.join(ctx.history, 'generation-0001.json'));
+  const restored = checkpoint.handleHook({ ...f.event('SessionStart'), source: 'compact' }, env);
+  assert.match(restored.hookSpecificOutput.additionalContext, /Repair state crash/);
+  const meta = JSON.parse(fs.readFileSync(ctx.meta, 'utf8'));
+  assert.equal(meta.completed_generations, 1);
+  assert.equal(meta.cursor.offset, fs.statSync(f.transcript).size);
+  assert.equal(JSON.parse(fs.readFileSync(ctx.current, 'utf8')).recovery_state, 'delivered');
+  assert.ok(fs.existsSync(ctx.markdown));
+  assert.ok(fs.existsSync(path.join(ctx.history, 'generation-0001.json')));
+});
+
+test('a pending recovery marker is rebuilt after an interrupted marker write', () => {
+  const f = fixture();
+  const env = {
+    ...f.env,
+    CONTEXT_CHECKPOINT_SIDECAR_EVERY: '1',
+    CONTEXT_CHECKPOINT_SIDECAR_MIN_BYTES: '1',
+  };
+  checkpoint.handleHook(f.event('PreCompact'), env, {
+    runSidecar() { return { status: 'completed', semantic: semantic('Repair marker crash') }; },
+  });
+  const ctx = checkpoint.resolveContext(f.event('PreCompact'), env);
+  const rename = fs.renameSync;
+  fs.renameSync = (source, target) => {
+    if (target === ctx.recovery) throw new Error('injected marker crash');
+    return rename(source, target);
+  };
+  try {
+    assert.throws(() => checkpoint.handleHook(f.event('PostCompact'), env), /injected marker crash/);
+  } finally {
+    fs.renameSync = rename;
+  }
+
+  assert.equal(JSON.parse(fs.readFileSync(ctx.current, 'utf8')).recovery_state, 'pending');
+  assert.equal(fs.existsSync(ctx.recovery), false);
+  const restored = checkpoint.handleHook(f.event('UserPromptSubmit', 'prompt-turn'), env);
+  assert.match(restored.hookSpecificOutput.additionalContext, /Repair marker crash/);
+  assert.equal(JSON.parse(fs.readFileSync(ctx.current, 'utf8')).recovery_state, 'delivered');
+  assert.equal(fs.existsSync(ctx.recovery), false);
+});
+
+test('a child prompt reconciles an interrupted completed checkpoint before recovery', () => {
+  const f = fixture();
+  const env = {
+    ...f.env,
+    CONTEXT_CHECKPOINT_SIDECAR_EVERY: '1',
+    CONTEXT_CHECKPOINT_SIDECAR_MIN_BYTES: '1',
+  };
+  const child = { ...f.event('PreCompact', 'child-turn'), agent_id: 'agent-1' };
+  checkpoint.handleHook(child, env, {
+    runSidecar() { return { status: 'completed', semantic: semantic('Repair child state') }; },
+  });
+  const ctx = checkpoint.resolveContext(child, env);
+  const rename = fs.renameSync;
+  fs.renameSync = (source, target) => {
+    if (target === ctx.meta) throw new Error('injected child state crash');
+    return rename(source, target);
+  };
+  try {
+    assert.throws(() => checkpoint.handleHook({
+      ...child, hook_event_name: 'PostCompact',
+    }, env), /injected child state crash/);
+  } finally {
+    fs.renameSync = rename;
+  }
+
+  const restored = checkpoint.handleHook({
+    ...child, hook_event_name: 'UserPromptSubmit', turn_id: 'prompt-turn',
+  }, env);
+  assert.match(restored.hookSpecificOutput.additionalContext, /Repair child state/);
+  const meta = JSON.parse(fs.readFileSync(ctx.meta, 'utf8'));
+  assert.equal(meta.completed_generations, 1);
+  assert.equal(meta.pending_turn_id, null);
+  assert.equal(meta.cursor.offset, fs.statSync(f.transcript).size);
+});
+
+test('the next PreCompact reconciles an interrupted completion before capturing', () => {
+  const f = fixture();
+  checkpoint.handleHook(f.event('PreCompact', 'turn-1'), f.env);
+  const ctx = checkpoint.resolveContext(f.event('PreCompact'), f.env);
+  const firstEnd = fs.statSync(f.transcript).size;
+  const rename = fs.renameSync;
+  fs.renameSync = (source, target) => {
+    if (target === ctx.meta) throw new Error('injected state crash before next compact');
+    return rename(source, target);
+  };
+  try {
+    assert.throws(() => checkpoint.handleHook(
+      f.event('PostCompact', 'turn-1'), f.env,
+    ), /injected state crash before next compact/);
+  } finally {
+    fs.renameSync = rename;
+  }
+
+  fs.appendFileSync(f.transcript, '{"turn":2}\n');
+  checkpoint.handleHook(f.event('PreCompact', 'turn-2'), f.env);
+  const current = JSON.parse(fs.readFileSync(ctx.current, 'utf8'));
+  const meta = JSON.parse(fs.readFileSync(ctx.meta, 'utf8'));
+  assert.equal(current.generation, 2);
+  assert.equal(current.transcript_delta.start_offset, firstEnd);
+  assert.equal(meta.completed_generations, 1);
+  assert.equal(meta.cursor.offset, firstEnd);
 });
 
 test('SessionStart fallback is root-only, compact-only, and transcript-exact', () => {
@@ -512,9 +661,11 @@ test('a terminal freshness rejection retires its pending recovery', () => {
     runSidecar() { return { status: 'completed', semantic: semantic('Stale delivery') }; },
   });
   checkpoint.handleHook(f.event('PostCompact'), env);
-  fs.appendFileSync(f.transcript, '{"newer":true}\n');
+  fs.writeFileSync(f.transcript, '{"turn":2}\n');
   assert.equal(checkpoint.handleHook(f.event('UserPromptSubmit'), env), null);
-  assert.equal(fs.existsSync(checkpoint.resolveContext(f.event('PreCompact'), env).recovery), false);
+  const ctx = checkpoint.resolveContext(f.event('PreCompact'), env);
+  assert.equal(JSON.parse(fs.readFileSync(ctx.current, 'utf8')).recovery_state, 'retired');
+  assert.equal(fs.existsSync(ctx.recovery), false);
 });
 
 test('semantic refresh does not re-arm an already consumed generation', () => {
@@ -680,6 +831,25 @@ test('unsafe and colliding identifiers stay inside distinct storage paths', () =
   for (const directory of directories) {
     const relative = path.relative(sessionsRoot, directory);
     assert.ok(relative && relative !== '..' && !relative.startsWith(`..${path.sep}`));
+  }
+});
+
+test('legacy dot identifiers cannot escape the sessions directory', () => {
+  for (const session of ['.', '..']) {
+    const f = fixture();
+    const sessionsRoot = path.join(f.data, 'sessions');
+    const legacyDir = session === '.' ? sessionsRoot : f.data;
+    fs.mkdirSync(legacyDir, { recursive: true });
+    fs.writeFileSync(path.join(legacyDir, 'current.json'), JSON.stringify({
+      session_id: session,
+      agent_id: null,
+      thread_id: session,
+    }));
+
+    const ctx = checkpoint.resolveContext(f.event('PreCompact', 'turn-1', session), f.env);
+    const relative = path.relative(sessionsRoot, ctx.sessionDir);
+    assert.ok(relative && relative !== '..' && !relative.startsWith(`..${path.sep}`));
+    assert.notEqual(ctx.sessionDir, legacyDir);
   }
 });
 
@@ -1194,6 +1364,208 @@ test('sidecar uses constrained launch settings and listed-delta instructions', (
   assert.match(observed.options.input, /untrusted data/);
   assert.match(observed.options.input, /Read only the listed delta files/);
   assert.match(observed.options.input, /do not inspect workspace files/);
+  assert.match(observed.options.input, /Do not infer missing facts, requirements, results/);
+  assert.match(observed.options.input, /unknown or ambiguous.*open_questions/i);
+  assert.match(observed.options.input, /preserve execution-critical literals verbatim/i);
+  assert.match(observed.options.input, /paths.*commands.*IDs.*numeric thresholds.*hashes.*error codes/i);
+  assert.match(observed.options.input, /preserve the polarity and scope/i);
+  assert.match(observed.options.input, /Runtime completion is not result validation/);
+});
+
+test('sidecar uses a disposable content-based view and records byte metrics', () => {
+  const dataBytes = Buffer.alloc(24 * 1024, 0x41);
+  const binaryBytes = Buffer.alloc(24 * 1024, 0x42);
+  const duplicate = `large-payload:${'D'.repeat(32 * 1024)}`;
+  const nearDuplicate = `${duplicate}!`;
+  const ordinary = `compiler error: ${'source-line '.repeat(4000)}`;
+  const dataUrl = `data:image/png;base64,${dataBytes.toString('base64')}`;
+  const protoRecord = `{"type":"future-record","__proto__":{"keep":"critical"},"nested":{"value":${JSON.stringify(dataUrl)}}}`;
+  const unsafeIntegerRecord = `{"image":"data:image/png;base64,QQ==","id":9007199254740993}`;
+  const firstDelta = [
+    protoRecord,
+    unsafeIntegerRecord,
+    JSON.stringify({ type: 'unknown-record', payload: { encoding: 'base64', media_type: 'application/octet-stream', data: binaryBytes.toString('base64') } }),
+    JSON.stringify({ type: 'ordinary-text', content: ordinary }),
+    JSON.stringify({ type: 'first-large', content: duplicate }),
+  ];
+  const secondDelta = [
+    JSON.stringify({ type: 'renamed-record', content: duplicate }),
+    JSON.stringify({ type: 'near-duplicate', content: nearDuplicate }),
+  ];
+  const f = fixture(firstDelta.join('\n') + '\n');
+  const env = {
+    ...f.env,
+    CONTEXT_CHECKPOINT_SIDECAR_EVERY: '2',
+    CONTEXT_CHECKPOINT_SIDECAR_MIN_BYTES: '1',
+    CONTEXT_CHECKPOINT_CODEX_BIN: process.execPath,
+  };
+  complete(f, 'turn-1', 'session-1', env);
+  fs.appendFileSync(f.transcript, secondDelta.join('\n') + '\n');
+  let projectedPaths;
+  let projectedBytes;
+  let rawPaths;
+  let rawHashes;
+  checkpoint.handleHook(f.event('PreCompact', 'turn-2'), env, {
+    runSidecar(state, ctx, sidecarEnv) {
+      rawPaths = [...state.sidecar_delta_paths];
+      rawHashes = rawPaths.map((file) => crypto.createHash('sha256')
+        .update(fs.readFileSync(file)).digest('hex'));
+      return checkpoint.runSidecar(state, ctx, sidecarEnv, (_command, args, options) => {
+        const prefix = 'Disposable sidecar-view files derived from transcript deltas since the last semantic checkpoint: ';
+        const line = options.input.split('\n').find((item) => item.startsWith(prefix));
+        projectedPaths = JSON.parse(line.slice(prefix.length));
+        assert.equal(projectedPaths.length, 2);
+        assert.ok(projectedPaths.every((file) => !state.sidecar_delta_paths.includes(file)));
+        projectedBytes = projectedPaths.reduce((total, file) => total + fs.statSync(file).size, 0);
+        const projectedLines = projectedPaths.flatMap((file) => fs.readFileSync(file, 'utf8')
+          .trimEnd().split('\n'));
+        assert.equal(projectedLines[1], unsafeIntegerRecord);
+        const projected = projectedLines.map((item) => JSON.parse(item));
+        assert.equal(Object.prototype.hasOwnProperty.call(projected[0], '__proto__'), true);
+        assert.deepEqual(projected[0].__proto__, { keep: 'critical' });
+        assert.match(projected[0].nested.value, /^\[sidecar-view data-url media=image\/png bytes=24576 sha256=[a-f0-9]{64}\]$/);
+        assert.equal(projected[1].image, 'data:image/png;base64,QQ==');
+        assert.match(projected[2].payload, /^\[sidecar-view binary media=application\/octet-stream bytes=24576 sha256=[a-f0-9]{64}\]$/);
+        assert.equal(projected[3].content, ordinary);
+        assert.equal(projected[4].content, duplicate);
+        assert.match(projected[5].content, /^\[sidecar-view duplicate bytes=32782 sha256=[a-f0-9]{64}; first occurrence retained\]$/);
+        assert.equal(projected[6].content, nearDuplicate);
+        const output = args[args.indexOf('--output-last-message') + 1];
+        fs.writeFileSync(output, JSON.stringify(semantic('Projected semantic state')));
+        return { status: 0 };
+      });
+    },
+  });
+
+  const current = readCurrent(f, 'session-1', env);
+  assert.equal(current.sidecar.status, 'completed');
+  assert.equal(current.sidecar.raw_input_bytes,
+    rawPaths.reduce((total, file) => total + fs.statSync(file).size, 0));
+  assert.equal(current.sidecar.projected_input_bytes, projectedBytes);
+  assert.equal(current.sidecar.reduction_bytes, current.sidecar.raw_input_bytes - projectedBytes);
+  assert.equal(current.sidecar.reduction_percent,
+    Number((100 * current.sidecar.reduction_bytes / current.sidecar.raw_input_bytes).toFixed(2)));
+  assert.equal(current.sidecar.masked_data_urls, 1);
+  assert.equal(current.sidecar.masked_binary_payloads, 1);
+  assert.equal(current.sidecar.deduplicated_payloads, 1);
+  rawPaths.forEach((file, index) => assert.equal(crypto.createHash('sha256')
+    .update(fs.readFileSync(file)).digest('hex'), rawHashes[index]));
+  assert.equal(rawHashes.at(-1), current.transcript_delta.sha256);
+  assert.ok(projectedPaths.every((file) => !fs.existsSync(file)));
+  assert.doesNotMatch(JSON.stringify(current.sidecar), /large-payload|source-line|data:image/);
+});
+
+test('sidecar deletes its projected view after local process failure', () => {
+  const f = fixture(JSON.stringify({ content: `data:image/png;base64,${Buffer.alloc(1024).toString('base64')}` }) + '\n');
+  const ctx = checkpoint.resolveContext(f.event('PreCompact'), f.env);
+  fs.mkdirSync(ctx.sessionDir, { recursive: true });
+  const before = crypto.createHash('sha256').update(fs.readFileSync(f.transcript)).digest('hex');
+  let projectedPaths;
+  const result = checkpoint.runSidecar({
+    generation: 1,
+    sidecar_delta_paths: [f.transcript],
+    semantic: semantic(),
+  }, ctx, {
+    ...process.env,
+    CONTEXT_CHECKPOINT_CODEX_BIN: process.execPath,
+  }, (_command, _args, options) => {
+    const prefix = 'Disposable sidecar-view files derived from transcript deltas since the last semantic checkpoint: ';
+    const line = options.input.split('\n').find((item) => item.startsWith(prefix));
+    projectedPaths = JSON.parse(line.slice(prefix.length));
+    return { status: 1, stderr: 'local failure' };
+  });
+  assert.equal(result.status, 'failed');
+  assert.equal(result.masked_data_urls, 1);
+  assert.ok(projectedPaths.every((file) => !fs.existsSync(file)));
+  assert.equal(crypto.createHash('sha256').update(fs.readFileSync(f.transcript)).digest('hex'), before);
+});
+
+test('invalid sidecar semantics cannot advance semantic coverage', () => {
+  const f = fixture();
+  complete(f, 'turn-1');
+  const semanticFile = path.join(f.root, 'semantic.json');
+  fs.writeFileSync(semanticFile, JSON.stringify(semantic('Stable baseline')));
+  assert.equal(runCli(f, ['semantic', '--input', semanticFile, '--thread-id', 'session-1']).status, 0);
+  fs.appendFileSync(f.transcript, '{"turn":2}\n');
+  checkpoint.handleHook(f.event('UserPromptSubmit', 'prompt-turn'), f.env);
+  const env = {
+    ...f.env,
+    CONTEXT_CHECKPOINT_CODEX_BIN: process.execPath,
+    CONTEXT_CHECKPOINT_SIDECAR_EVERY: '2',
+    CONTEXT_CHECKPOINT_SIDECAR_MIN_BYTES: '1',
+  };
+  checkpoint.handleHook(f.event('PreCompact', 'turn-2'), env, {
+    spawnSync(_command, args) {
+      const output = args[args.indexOf('--output-last-message') + 1];
+      fs.writeFileSync(output, JSON.stringify({ ...semantic(), next_actions: [] }));
+      return { status: 0 };
+    },
+  });
+  const ctx = checkpoint.resolveContext(f.event('PreCompact', 'turn-2'), env);
+  let current = JSON.parse(fs.readFileSync(ctx.current, 'utf8'));
+  let meta = JSON.parse(fs.readFileSync(ctx.meta, 'utf8'));
+  const failedDelta = current.transcript_delta.delta_path;
+  assert.equal(current.sidecar.status, 'failed');
+  assert.match(current.sidecar.error, /next_actions.*at least 1/i);
+  assert.equal(current.semantic.goal, 'Stable baseline');
+  assert.equal(current.semantic_source, 'manual');
+  assert.equal(current.semantic_generation, 1);
+  assert.equal(meta.semantic_generation, 1);
+  assert.ok(JSON.parse(runCli(
+    f, ['status', '--thread-id', 'session-1'], env,
+  ).stdout).unseen_delta_paths.includes(failedDelta));
+
+  checkpoint.handleHook(f.event('PostCompact', 'turn-2'), env);
+  fs.appendFileSync(f.transcript, '{"turn":3}\n');
+  let retriedPaths;
+  checkpoint.handleHook(f.event('PreCompact', 'turn-3'), {
+    ...env, CONTEXT_CHECKPOINT_SIDECAR_EVERY: '1',
+  }, {
+    runSidecar(state) {
+      retriedPaths = state.sidecar_delta_paths;
+      return { status: 'completed', semantic: semantic('Recovered backlog') };
+    },
+  });
+  current = JSON.parse(fs.readFileSync(ctx.current, 'utf8'));
+  meta = JSON.parse(fs.readFileSync(ctx.meta, 'utf8'));
+  assert.ok(retriedPaths.includes(failedDelta));
+  assert.equal(current.semantic.goal, 'Recovered backlog');
+  assert.equal(current.semantic_source, 'sidecar');
+  assert.equal(current.semantic_generation, 3);
+  assert.equal(meta.semantic_generation, 3);
+});
+
+test('sidecar refuses a same-length delta checksum mismatch', () => {
+  const f = fixture();
+  const env = {
+    ...f.env,
+    CONTEXT_CHECKPOINT_SIDECAR_EVERY: '2',
+    CONTEXT_CHECKPOINT_SIDECAR_MIN_BYTES: '1',
+  };
+  let calls = 0;
+  const deps = {
+    runSidecar() {
+      calls += 1;
+      return { status: 'completed', semantic: semantic('Must not advance') };
+    },
+  };
+  complete(f, 'turn-1', 'session-1', env, deps);
+  const first = readCurrent(f, 'session-1', env);
+  const corrupted = fs.readFileSync(first.transcript_delta.delta_path);
+  corrupted[0] ^= 1;
+  fs.writeFileSync(first.transcript_delta.delta_path, corrupted);
+
+  fs.appendFileSync(f.transcript, '{"turn":2}\n');
+  checkpoint.handleHook(f.event('PreCompact', 'turn-2'), env, deps);
+  const current = readCurrent(f, 'session-1', env);
+  const meta = JSON.parse(fs.readFileSync(checkpoint.resolveContext(
+    f.event('PreCompact', 'turn-2'), env,
+  ).meta, 'utf8'));
+  assert.equal(calls, 0);
+  assert.equal(current.sidecar.status, 'failed');
+  assert.match(current.sidecar.error, /checksum mismatch.*generation 1/i);
+  assert.equal(current.semantic_generation, 0);
+  assert.equal(meta.semantic_generation, 0);
 });
 
 test('retention preserves every delta newer than semantic_generation for a later sidecar', () => {
@@ -1388,6 +1760,65 @@ test('status explains whether the current checkpoint can be restored', () => {
   assert.equal(stale.restore_reason, 'unexpected_transcript_tail');
 });
 
+test('semantic writes and legacy restore require a goal and next action only', () => {
+  const writable = fixture();
+  complete(writable);
+  const semanticFile = path.join(writable.root, 'semantic.json');
+  const missingGoal = semantic();
+  missingGoal.goal = '';
+  fs.writeFileSync(semanticFile, JSON.stringify(missingGoal));
+  let result = runCli(writable, ['semantic', '--input', semanticFile, '--thread-id', 'session-1']);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /goal.*non-empty/i);
+
+  const missingNext = semantic();
+  missingNext.next_actions = [];
+  fs.writeFileSync(semanticFile, JSON.stringify(missingNext));
+  result = runCli(writable, ['semantic', '--input', semanticFile, '--thread-id', 'session-1']);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /next_actions.*at least 1/i);
+
+  missingNext.next_actions = [''];
+  fs.writeFileSync(semanticFile, JSON.stringify(missingNext));
+  result = runCli(writable, ['semantic', '--input', semanticFile, '--thread-id', 'session-1']);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /next_actions.*non-empty/i);
+
+  const minimal = semantic();
+  minimal.constraints = [];
+  minimal.acceptance_criteria = [];
+  fs.writeFileSync(semanticFile, JSON.stringify(minimal));
+  result = runCli(writable, ['semantic', '--input', semanticFile, '--thread-id', 'session-1']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(runCli(
+    writable, ['status', '--thread-id', 'session-1'],
+  ).stdout).restore_reason, 'eligible');
+
+  for (const [field, value, reason] of [
+    ['goal', '', 'goal_missing'],
+    ['goal', '   ', 'goal_missing'],
+    ['next_actions', [], 'next_action_missing'],
+    ['next_actions', ['\t'], 'next_action_missing'],
+  ]) {
+    const legacy = fixture();
+    complete(legacy);
+    const file = path.join(legacy.root, 'semantic.json');
+    fs.writeFileSync(file, JSON.stringify(semantic('Legacy semantic')));
+    assert.equal(runCli(legacy, ['semantic', '--input', file, '--thread-id', 'session-1']).status, 0);
+    const ctx = checkpoint.resolveContext(legacy.event('PreCompact'), legacy.env);
+    const current = JSON.parse(fs.readFileSync(ctx.current, 'utf8'));
+    current.semantic[field] = value;
+    delete current.recovery_state;
+    fs.writeFileSync(ctx.current, JSON.stringify(current));
+    assert.equal(fs.existsSync(ctx.recovery), true);
+    const status = JSON.parse(runCli(legacy, ['status', '--thread-id', 'session-1']).stdout);
+    assert.equal(status.restore_reason, reason);
+    assert.equal(checkpoint.handleHook({ ...legacy.event('SessionStart'), source: 'compact' }, legacy.env), null);
+    assert.equal(JSON.parse(fs.readFileSync(ctx.current, 'utf8')).recovery_state, 'retired');
+    assert.equal(fs.existsSync(ctx.recovery), false);
+  }
+});
+
 test('manual semantic coverage uses the committed cursor after compact transcript growth', () => {
   const f = fixture('before-compact');
   checkpoint.handleHook(f.event('PreCompact'), f.env);
@@ -1404,7 +1835,7 @@ test('manual semantic coverage uses the committed cursor after compact transcrip
   assert.equal(status.restore_eligible, true);
 });
 
-test('manual semantic restores after the host appends its lifecycle tail following PostCompact', () => {
+test('manual semantic restores after an opaque host append following PostCompact', () => {
   const f = fixture('generation-one');
   complete(f);
   assert.equal(checkpoint.handleHook({ ...f.event('SessionStart'), source: 'compact' }, f.env), null);
@@ -1415,12 +1846,7 @@ test('manual semantic restores after the host appends its lifecycle tail followi
 
   fs.appendFileSync(f.transcript, '-assistant-output');
   complete(f, 'turn-2');
-  fs.appendFileSync(f.transcript, ['task_complete', 'thread_settings_applied', 'task_started']
-    .map((type) => `${JSON.stringify({
-      type: 'event_msg',
-      payload: { type, ...(type === 'task_complete' ? { turn_id: 'turn-2' } : {}) },
-    })}\n`)
-    .join(''));
+  fs.appendFileSync(f.transcript, 'opaque-host-tail\n');
   const restored = checkpoint.handleHook({ ...f.event('SessionStart', 'turn-2'), source: 'compact' }, f.env);
   assert.match(restored.hookSpecificOutput.additionalContext, /Manual then compact/);
   const ctx = checkpoint.resolveContext(f.event('PreCompact'), f.env);
@@ -1632,20 +2058,91 @@ test('workspace fingerprint is explicitly a cheap status marker', () => {
 });
 
 test('semantic schema rejects unbounded or unknown content', () => {
+  const schema = require('../schemas/semantic-checkpoint.schema.json');
+  assert.equal(schema.properties.goal.minLength, 1);
+  assert.equal(schema.properties.goal.maxLength, 200);
+  assert.equal(schema.properties.goal.pattern, '^[^\\r\\n]*\\S[^\\r\\n]*$');
+  assert.equal(schema.properties.next_actions.minItems, 1);
+  assert.equal(schema.properties.next_actions.maxItems, 3);
+  assert.equal(schema.properties.next_actions.items.minLength, 1);
+  assert.equal(schema.properties.next_actions.items.pattern, '^[^\\r\\n]*\\S[^\\r\\n]*$');
+  assert.equal(schema.properties.next_actions.items.maxLength, 80);
+  assert.equal(schema.$defs.items.maxItems, 3);
+  assert.equal(schema.$defs.items.items.minLength, 1);
+  assert.equal(schema.$defs.items.items.maxLength, 80);
+  assert.equal(schema.$defs.items.items.pattern, '^[^\\r\\n]*\\S[^\\r\\n]*$');
   assert.throws(() => checkpoint.validateSemantic({ goal: '', extra: true }), /unsupported/);
   assert.throws(() => checkpoint.validateSemantic({
     ...checkpoint.emptySemantic(),
-    next_actions: new Array(4).fill('x'),
+    goal: '',
+    next_actions: ['Continue'],
+  }), /goal.*non-empty/i);
+  assert.throws(() => checkpoint.validateSemantic({
+    ...semantic(), goal: '   ',
+  }), /goal.*non-whitespace/i);
+  assert.throws(() => checkpoint.validateSemantic({
+    ...semantic(), goal: 'Real goal\n## Next actions',
+  }), /goal.*single-line/i);
+  assert.throws(() => checkpoint.validateSemantic({
+    ...checkpoint.emptySemantic(),
+    goal: 'Continue task',
+  }), /next_actions.*at least 1/i);
+  assert.throws(() => checkpoint.validateSemantic({
+    ...semantic(), next_actions: ['\t'],
+  }), /items.*non-whitespace/i);
+  assert.throws(() => checkpoint.validateSemantic({
+    ...semantic(),
+    next_actions: ['one', 'two', 'three', 'four'],
   }), /at most 3/);
-  const multibyte = { ...checkpoint.emptySemantic(), goal: '目'.repeat(200) };
+  const multibyte = { ...semantic(), goal: '目'.repeat(200) };
   for (const key of Object.keys(multibyte).filter((key) => Array.isArray(multibyte[key]))) {
-    multibyte[key] = new Array(3).fill('验'.repeat(27));
+    multibyte[key] = new Array(3).fill('验'.repeat(80));
   }
-  assert.throws(() => checkpoint.validateSemantic(multibyte), /2500 UTF-8 bytes/);
+  assert.doesNotThrow(() => checkpoint.validateSemantic(multibyte));
+  const astral = {
+    ...semantic(),
+    goal: '😀'.repeat(200),
+    constraints: ['🚧'.repeat(80)],
+  };
+  assert.doesNotThrow(() => checkpoint.validateSemantic(astral));
+  assert.throws(() => checkpoint.validateSemantic({
+    ...semantic(), constraints: ['x'.repeat(81)],
+  }), /80 characters/);
+  assert.throws(() => checkpoint.validateSemantic({
+    ...semantic(), decisions: ['Decision\n## Goal'],
+  }), /single-line/);
+  assert.doesNotThrow(() => checkpoint.validateSemantic({
+    ...semantic(),
+    constraints: [],
+    acceptance_criteria: [],
+    decisions: ['plugins/context-checkpoint/hooks/context-checkpoint.cjs'],
+    current_progress: ['sha256:'.concat('a'.repeat(64))],
+  }));
+  const duplicated = semantic();
+  duplicated.negative_knowledge = ['Do not rerun', 'do not rerun', 'Do not rerun'];
+  duplicated.constraints = ['Do not rerun', 'Do not rerun '];
+  assert.deepEqual(checkpoint.validateSemantic(duplicated).negative_knowledge,
+    ['Do not rerun', 'do not rerun']);
+  assert.deepEqual(checkpoint.validateSemantic(duplicated).constraints,
+    ['Do not rerun', 'Do not rerun ']);
 });
 
 test('package and plugin manifest versions match', () => {
   const pkg = require('../package.json');
   const plugin = require('../.codex-plugin/plugin.json');
   assert.equal(plugin.version, pkg.version);
+});
+
+test('semantic quality benchmark has a model-free self-check', () => {
+  const result = spawnSync(process.execPath, [
+    path.join(project, 'bench', 'semantic-quality.cjs'), '--self-test',
+  ], { cwd: project, encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    benchmark: 'context-checkpoint-sidecar-semantic-quality',
+    mode: 'self-test',
+    model_or_network_calls: 0,
+    fixtures: 3,
+    status: 'passed',
+  });
 });

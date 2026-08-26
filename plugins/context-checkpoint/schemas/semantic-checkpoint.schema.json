@@ -13,20 +13,40 @@
     "next_actions"
   ],
   "properties": {
-    "goal": {"type": "string", "maxLength": 200},
+    "goal": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[^\\r\\n]*\\S[^\\r\\n]*$"
+    },
     "acceptance_criteria": {"$ref": "#/$defs/items"},
     "constraints": {"$ref": "#/$defs/items"},
     "decisions": {"$ref": "#/$defs/items"},
     "current_progress": {"$ref": "#/$defs/items"},
     "negative_knowledge": {"$ref": "#/$defs/items"},
     "open_questions": {"$ref": "#/$defs/items"},
-    "next_actions": {"$ref": "#/$defs/items"}
+    "next_actions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 3,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 80,
+        "pattern": "^[^\\r\\n]*\\S[^\\r\\n]*$"
+      }
+    }
   },
   "$defs": {
     "items": {
       "type": "array",
       "maxItems": 3,
-      "items": {"type": "string", "maxLength": 50}
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 80,
+        "pattern": "^[^\\r\\n]*\\S[^\\r\\n]*$"
+      }
     }
   }
 }

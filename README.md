@@ -17,6 +17,11 @@
 
 <p align="center">Incremental checkpoints, freshness-gated recovery, and no extra model calls by default.</p>
 
+## Modes
+
+- **Default mechanical mode** automatically records transcript deltas, lifecycle state, and a committed cursor. It does not generate or inject semantic task state.
+- **Optional semantic recovery mode** requires an explicit `$context-checkpoint` refresh or the opt-in sidecar. Only a fresh, non-empty semantic checkpoint is injected once after compaction.
+
 ## The problem
 
 After a long task has crossed several compaction boundaries, its recovery state is difficult to inspect. Repeatedly scanning the full transcript grows with the task, while blindly restoring an old summary risks injecting stale goals, decisions, or next actions. Codex Checkpoint adds a small, deterministic recovery layer while native Codex compaction remains the primary semantic compressor.
@@ -32,16 +37,16 @@ After a long task has crossed several compaction boundaries, its recovery state 
 **With Codex Checkpoint**
 
 - `PreCompact` captures only unseen transcript bytes
-- `PostCompact` commits the completed generation and transcript cursor
-- `SessionStart` restores root tasks only when freshness checks pass; `UserPromptSubmit` is a one-shot fallback for compacted subtasks
+- `PostCompact` commits the completed generation and transcript cursor; an exact root `SessionStart(compact)` can finish a missed `PostCompact`
+- When semantic state exists, `SessionStart` restores root tasks only after freshness checks; the first matching `UserPromptSubmit` is a one-shot fallback when that restore is unavailable and for compacted subtasks
 
 ## Why Codex Checkpoint
 
 - **Low overhead by default** — deterministic Node.js hooks make no network request and launch no model.
 - **Incremental, not cumulative** — each generation stores only the uncommitted transcript byte range.
 - **Freshness-gated recovery** — replaced, rewritten, stale, or mismatched transcripts are not auto-injected.
-- **Observable, one-shot restore** — stable eligibility reasons explain every restore decision; root and subtask fallbacks retain pending recovery when local hook output fails.
-- **Failure-safe lifecycle** — the completed-generation count and committed transcript cursor advance only during `PostCompact`.
+- **Observable, one-shot restore** — stable eligibility reasons and a metadata-only local-output receipt support audits; failed local hook output retains pending recovery for retry.
+- **Failure-safe lifecycle** — lifecycle completion commits once, from `PostCompact` or the exact root-only `SessionStart(compact)` fallback, with its source recorded.
 - **No repository pollution** — state lives under Codex/plugin data, never in the target workspace.
 - **Semantic refresh when useful** — a manual skill and an opt-in read-only sidecar can preserve bounded task semantics.
 
@@ -60,14 +65,14 @@ Run it with `npm run benchmark`. This is an input-byte proxy from a synthetic fi
 
 ### Lifecycle and failure-mode coverage
 
-The repository includes **36 automated tests** covering lock ownership, idempotency, transcript replacement and rewrite detection, stale-state rejection, one-shot root and subtask recovery, failed-output retry, restore diagnostics, retained-history inspection, storage reporting, atomic metadata updates, retention, accumulated sidecar thresholds, sidecar isolation, recursion guards, CLI ambiguity, Windows launcher behavior, and bounded schema validation.
+The automated tests cover lock ownership, idempotency, transcript replacement and rewrite detection, stale-state rejection, root fallback completion, one-shot root and subtask recovery, failed-output receipts and retry, restore diagnostics, identity discovery, retained-history inspection, storage reporting, atomic metadata updates, retention, accumulated sidecar thresholds, sidecar launch constraints, recursion guards, CLI ambiguity, Windows launcher behavior, and bounded schema validation.
 
 ```bash
 cd plugins/context-checkpoint
 npm test
 ```
 
-The tests and benchmark are the reproducible public evidence. Host smoke runs validate integration behavior but are not presented as cross-machine performance data.
+The tests and benchmark are the reproducible public evidence for these code paths. They do not replace a restarted-host acceptance run of manual semantic refresh → compact → `SessionStart` or first-prompt fallback restore.
 
 ## How it works
 
@@ -76,8 +81,9 @@ Codex task
   -> PreCompact: capture deterministic delta + workspace marker
   -> native compact: primary semantic compression
   -> PostCompact: commit generation + transcript cursor
-  -> SessionStart(compact): one-shot root restore after freshness checks
-  -> UserPromptSubmit: one-shot fallback when a compacted subtask has no SessionStart
+     (or exact root SessionStart(compact) fallback if PostCompact was missed)
+  -> SessionStart(compact): one-shot root restore when a semantic checkpoint exists and is fresh
+  -> UserPromptSubmit: one-shot fallback for the first matching post-compact prompt and fresh semantic subtasks
 ```
 
 `$context-checkpoint` can additionally refresh a bounded semantic record containing Goal, Constraints, Decisions, Progress, Negative Knowledge, Open Questions, and Next Actions.
@@ -99,7 +105,9 @@ codex plugin marketplace add wcf778/codex-checkpoint
 codex plugin add context-checkpoint@context-checkpoint
 ```
 
-Restart Codex, review the command hooks when prompted, and start a new task. Routine compaction then needs no manual action.
+Restart Codex, review the command hooks when prompted, and start a new task. Routine mechanical capture then needs no manual action; semantic recovery still requires the manual Skill or an explicitly enabled sidecar.
+
+The Skill is explicit-only and may be absent from the initial automatic Skill list. After installation or updates, use a new task and select `$context-checkpoint` explicitly; if the update is still unavailable, restart Codex.
 
 The repository and marketplace are named `codex-checkpoint`; the installed plugin id remains `context-checkpoint` for compatibility.
 
@@ -113,6 +121,8 @@ For an explicit semantic refresh at a handoff or phase boundary:
 $context-checkpoint refresh the current task checkpoint
 ```
 
+For immediate recovery, compact before submitting another normal user prompt. A later prompt invalidates the pending manual carry-forward rather than treating newer task changes as covered.
+
 ## Advanced usage
 
 <details>
@@ -125,6 +135,7 @@ Run these commands from the plugin directory:
 ```bash
 node hooks/context-checkpoint.cjs sessions
 node hooks/context-checkpoint.cjs sessions --storage
+node hooks/context-checkpoint.cjs sessions --discover
 node hooks/context-checkpoint.cjs status --thread-id <selector>
 node hooks/context-checkpoint.cjs history --thread-id <selector>
 node hooks/context-checkpoint.cjs show --thread-id <selector>
@@ -132,7 +143,7 @@ node hooks/context-checkpoint.cjs show --generation <n> --thread-id <selector>
 node hooks/context-checkpoint.cjs semantic --input checkpoint.json --thread-id <selector>
 ```
 
-Manual commands refuse to guess when a workspace has multiple threads. Use the `selector` returned by `sessions` with `--thread-id`; `--session-id` remains a root-task compatibility alias. `status` reports retained deltas unseen by the semantic checkpoint and restore eligibility; retention never removes those unseen deltas. `history` indexes retained generations, and `sessions --storage` reports per-thread bytes, last update, restore eligibility, and workspace totals without deleting anything. Hook recovery uses a dedicated task-state payload capped at the configured 2500-byte context limit; `show` keeps the full diagnostic view.
+Manual commands refuse to guess when a workspace has multiple threads. Use the `selector` returned by `sessions` with `--thread-id`; child selectors use `agent:<encoded-session-id>:<encoded-agent-id>`, and `--session-id` remains a root-task compatibility alias. `status` reports restore eligibility plus a reset-aware semantic backlog; a missing history or delta range is reported explicitly and blocks sidecar advancement. Retention never removes an unresolved backlog. `history` indexes retained generations, and `sessions --storage` reports per-thread bytes, last update, restore eligibility, and workspace totals without deleting anything. `sessions --discover` read-only reports alternate stored identities with the exact same normalized workspace root; it never merges or selects them. To inspect one explicitly, set `CONTEXT_CHECKPOINT_DATA_DIR` for that command to `PLUGIN_DATA/workspaces/<identity>/context-checkpoint`, or to `CODEX_HOME/plugin-data/context-checkpoint/workspaces/<identity>` when using the fallback layout. Hook recovery uses a dedicated task-state payload and semantic validation rejects payloads over 2,500 UTF-8 bytes. The configured `additionalContextLimit: 2500` is an approximate 2,500-token threshold; for larger hook context, Codex stores the full content in a temporary file and provides a head/tail preview. `show` keeps the full diagnostic view.
 
 </details>
 
@@ -155,15 +166,15 @@ $env:CONTEXT_CHECKPOINT_SIDECAR_EVERY = '3'
 $env:CONTEXT_CHECKPOINT_SIDECAR_MIN_BYTES = '32768'
 ```
 
-The child runs with `codex exec --ephemeral --sandbox read-only`, hooks disabled, a minimal environment, and only transcript deltas unseen by the last semantic checkpoint. It cannot browse the target workspace. A sidecar failure never blocks native compaction.
+The child runs with `codex exec --ephemeral --sandbox read-only`, hooks disabled, and a minimal environment. Its cwd is not the target workspace, it has no write permission, and it is instructed to read only the listed transcript deltas unseen by the last semantic checkpoint. These launch constraints are not a hard local-file read isolation boundary. A sidecar failure never blocks native compaction.
 
 </details>
 
 ## Storage and privacy
 
 - Raw transcript deltas are stored under `PLUGIN_DATA/workspaces/<workspace-id>/context-checkpoint`. If `PLUGIN_DATA` is unavailable, the fallback is under `CODEX_HOME/plugin-data/context-checkpoint`; state is never written to the target repository.
-- Transcript deltas can contain sensitive conversation content. Protect the Codex data directory with normal user-directory permissions.
-- A single delta is limited to 64 MiB by default. The newest 50 generations plus any older generations not yet covered by the semantic checkpoint are retained. Override the limits with `CONTEXT_CHECKPOINT_MAX_DELTA_BYTES` and `CONTEXT_CHECKPOINT_RETENTION_GENERATIONS`.
+- Transcript deltas can contain sensitive conversation content. Plugin-created directories/files request `0700`/`0600` modes on POSIX; Windows continues to use the account's existing ACLs.
+- A single delta is limited to 64 MiB by default. An oversized range is recorded as `skipped-too-large`; its cursor advances only after lifecycle completion, later deltas resume normally, and the explicit semantic gap blocks sidecar coverage until a manual semantic baseline is created. The newest 50 generations plus any older generations not yet covered by the semantic checkpoint are retained. Override the limits with `CONTEXT_CHECKPOINT_MAX_DELTA_BYTES` and `CONTEXT_CHECKPOINT_RETENTION_GENERATIONS`.
 - Historical sessions are not deleted automatically. Inspect their size with `sessions --storage`; cleanup remains an explicit operator action.
 - The deterministic hook path makes no network request. Enabling the sidecar explicitly sends its prompt through the configured Codex execution path.
 

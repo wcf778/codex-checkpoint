@@ -19,7 +19,7 @@ const SEMANTIC_KEYS = [
 const SEMANTIC_GOAL_MAX = 200;
 const SEMANTIC_ITEMS_MAX = 3;
 const SEMANTIC_ITEM_MAX = 50;
-const RESTORE_CONTEXT_LIMIT = 2500;
+const RESTORE_PAYLOAD_MAX_BYTES = 2500;
 
 function sha256(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
@@ -88,8 +88,29 @@ function workspaceSnapshot(cwd, includeStatus = true) {
   };
 }
 
-function safeSegment(value) {
+function legacyStorageKey(value) {
   return String(value || 'unknown').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120);
+}
+
+function logicalThreadId(input) {
+  const sessionId = String(input.session_id || 'unknown');
+  if (input.agent_id) {
+    return `agent:${encodeURIComponent(sessionId)}:${encodeURIComponent(String(input.agent_id))}`;
+  }
+  return sessionId.includes(':') ? `session:${encodeURIComponent(sessionId)}` : sessionId;
+}
+
+function storageKey(value) {
+  const raw = String(value || 'unknown');
+  const reserved = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
+  if (raw !== '.'
+    && raw !== '..'
+    && !raw.endsWith('.')
+    && !reserved.test(raw)
+    && /^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/.test(raw)) {
+    return raw;
+  }
+  return `id-${sha256(raw).slice(0, 32)}`;
 }
 
 function defaultDataBase(env, workspace) {
@@ -101,23 +122,54 @@ function defaultDataBase(env, workspace) {
   return path.join(codexHome, 'plugin-data', 'context-checkpoint', 'workspaces', workspace.identity);
 }
 
-function recoveryPath(input, env = process.env) {
-  const threadId = safeSegment(input.agent_id || input.session_id);
+function recoveryDirectory(env = process.env) {
   if (env.CONTEXT_CHECKPOINT_DATA_DIR) {
-    return path.join(path.resolve(env.CONTEXT_CHECKPOINT_DATA_DIR), 'recovery-pending', `${threadId}.json`);
+    return path.join(path.resolve(env.CONTEXT_CHECKPOINT_DATA_DIR), 'recovery-pending');
   }
   if (env.PLUGIN_DATA) {
-    return path.join(path.resolve(env.PLUGIN_DATA), 'recovery-pending', 'context-checkpoint', `${threadId}.json`);
+    return path.join(path.resolve(env.PLUGIN_DATA), 'recovery-pending', 'context-checkpoint');
   }
   const codexHome = path.resolve(env.CODEX_HOME || path.join(os.homedir(), '.codex'));
-  return path.join(codexHome, 'plugin-data', 'context-checkpoint', 'recovery-pending', `${threadId}.json`);
+  return path.join(codexHome, 'plugin-data', 'context-checkpoint', 'recovery-pending');
+}
+
+function recoveryPath(input, env = process.env) {
+  return path.join(recoveryDirectory(env), `${storageKey(logicalThreadId(input))}.json`);
+}
+
+function verifiedLegacyRecoveryPath(input, env = process.env) {
+  const legacy = path.join(
+    recoveryDirectory(env),
+    `${legacyStorageKey(input.agent_id || input.session_id)}.json`,
+  );
+  if (sameResolvedPath(legacy, recoveryPath(input, env))) return null;
+  let pending;
+  try { pending = readJson(legacy); } catch { return null; }
+  return pending?.session_id === input.session_id
+    && (pending.agent_id || null) === (input.agent_id || null)
+    ? legacy
+    : null;
 }
 
 function resolveContext(input, env = process.env, includeStatus = true) {
   const workspace = workspaceSnapshot(input.cwd, includeStatus);
   const base = defaultDataBase(env, workspace);
-  const threadId = input.agent_id || input.session_id;
-  const sessionDir = path.join(base, 'sessions', safeSegment(threadId));
+  const threadId = logicalThreadId(input);
+  const sessionsDir = path.join(base, 'sessions');
+  const canonicalDir = path.join(sessionsDir, storageKey(threadId));
+  let sessionDir = canonicalDir;
+  if (!fs.existsSync(canonicalDir)) {
+    const legacyDir = path.join(
+      sessionsDir,
+      legacyStorageKey(input.agent_id || input.session_id),
+    );
+    let legacy;
+    try { legacy = readJson(path.join(legacyDir, 'current.json')); } catch {}
+    if (legacy?.session_id === input.session_id
+      && (legacy.agent_id || null) === (input.agent_id || null)) {
+      sessionDir = legacyDir;
+    }
+  }
   return {
     workspace,
     threadId,
@@ -133,6 +185,39 @@ function resolveContext(input, env = process.env, includeStatus = true) {
   };
 }
 
+function sameResolvedPath(left, right) {
+  if (!left || !right) return false;
+  const resolvedLeft = path.resolve(left);
+  const resolvedRight = path.resolve(right);
+  return process.platform === 'win32'
+    ? resolvedLeft.toLowerCase() === resolvedRight.toLowerCase()
+    : resolvedLeft === resolvedRight;
+}
+
+function checkpointMatchesEvent(checkpoint, input) {
+  if (!sameResolvedPath(checkpoint?.transcript_delta?.path, input.transcript_path)) return false;
+  return input.hook_event_name !== 'PostCompact'
+    || (['preparing', 'complete'].includes(checkpoint.status) && checkpoint.turn_id === input.turn_id);
+}
+
+function resolveLifecycleContext(input, env = process.env, includeStatus = true) {
+  const root = resolveContext(input, env, includeStatus);
+  if (input.agent_id || !input.transcript_path) return root;
+  if (checkpointMatchesEvent(readJson(root.current), input)) return root;
+
+  const children = listSessions(root.base).map((storage) => {
+    try {
+      return readJson(path.join(root.base, 'sessions', storage, 'current.json'));
+    } catch {
+      return null;
+    }
+  }).filter((current) => current?.session_id === input.session_id
+    && current.agent_id
+    && checkpointMatchesEvent(current, input));
+  if (children.length !== 1) return null;
+  return resolveContext({ ...input, agent_id: children[0].agent_id }, env, includeStatus);
+}
+
 function readJson(file, fallback = null) {
   try {
     return JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -143,9 +228,9 @@ function readJson(file, fallback = null) {
 }
 
 function atomicWrite(file, content) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const temporary = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
-  fs.writeFileSync(temporary, content);
+  fs.writeFileSync(temporary, content, { flag: 'wx', mode: 0o600 });
   fs.renameSync(temporary, file);
 }
 
@@ -184,6 +269,10 @@ function validateSemantic(value) {
       throw new Error(`${key} items must be strings no longer than ${SEMANTIC_ITEM_MAX} characters`);
     }
   }
+  const payloadBytes = Buffer.byteLength(renderRestoreContext({ semantic: value }), 'utf8');
+  if (payloadBytes > RESTORE_PAYLOAD_MAX_BYTES) {
+    throw new Error(`semantic restore payload must not exceed ${RESTORE_PAYLOAD_MAX_BYTES} UTF-8 bytes`);
+  }
   return value;
 }
 
@@ -218,16 +307,6 @@ function renderMarkdown(checkpoint) {
   return `${lines.join('\n')}\n`;
 }
 
-function truncateUtf8(value, maximum) {
-  const buffer = Buffer.from(value, 'utf8');
-  if (buffer.length <= maximum) return value;
-  const suffix = Buffer.from('…', 'utf8');
-  if (maximum < suffix.length) return '';
-  let end = maximum - suffix.length;
-  while (end > 0 && (buffer[end] & 0xc0) === 0x80) end -= 1;
-  return `${buffer.subarray(0, end).toString('utf8')}…`;
-}
-
 function renderRestoreContext(checkpoint) {
   const semantic = checkpoint.semantic || emptySemantic();
   const sections = [
@@ -240,31 +319,12 @@ function renderRestoreContext(checkpoint) {
     ['Open questions', semantic.open_questions],
     ['Acceptance criteria', semantic.acceptance_criteria],
   ];
-  const values = sections.flatMap(([, items]) => items || []);
-  const render = (content) => {
-    let index = 0;
-    const lines = ['# Context restore'];
-    for (const [title, items] of sections) {
-      if (!items?.length) continue;
-      lines.push('', `## ${title}`, '', ...items.map(() => `- ${content[index++]}`));
-    }
-    return `${lines.join('\n')}\n`;
-  };
-  const full = render(values);
-  if (Buffer.byteLength(full, 'utf8') <= RESTORE_CONTEXT_LIMIT) return full;
-
-  const fixed = render(values.map(() => ''));
-  const budget = RESTORE_CONTEXT_LIMIT - Buffer.byteLength(fixed, 'utf8');
-  const total = values.reduce((sum, value) => sum + Buffer.byteLength(value, 'utf8'), 0);
-  const fitted = values.map((value) => truncateUtf8(
-    value,
-    Math.floor(budget * Buffer.byteLength(value, 'utf8') / total),
-  ));
-  const result = render(fitted);
-  if (Buffer.byteLength(result, 'utf8') > RESTORE_CONTEXT_LIMIT) {
-    throw new Error('restore context exceeds hook limit');
+  const lines = ['# Context restore'];
+  for (const [title, items] of sections) {
+    if (!items?.length) continue;
+    lines.push('', `## ${title}`, '', ...items.map((item) => `- ${item}`));
   }
-  return result;
+  return `${lines.join('\n')}\n`;
 }
 
 function readRange(file, start, length) {
@@ -285,7 +345,7 @@ function readRange(file, start, length) {
 }
 
 function copyRange(file, start, length, destination) {
-  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
   const temporary = `${destination}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   const hash = crypto.createHash('sha256');
   const buffer = Buffer.alloc(Math.min(64 * 1024, Math.max(1, length)));
@@ -294,7 +354,7 @@ function copyRange(file, start, length, destination) {
   let copied = 0;
   try {
     input = fs.openSync(file, 'r');
-    output = fs.openSync(temporary, 'wx');
+    output = fs.openSync(temporary, 'wx', 0o600);
     while (copied < length) {
       const read = fs.readSync(input, buffer, 0, Math.min(buffer.length, length - copied), start + copied);
       if (read === 0) break;
@@ -358,14 +418,15 @@ function semanticCoversDelta(coverage, delta) {
     && expected.boundary_sha256 === actual.boundary_sha256;
 }
 
-function onlyCompactionMetadata(file, start, end) {
-  if (end === start) return true;
-  if (end - start > 1024 * 1024) return false;
+function manualAnchorCoversDelta(anchor, delta) {
+  if (!anchor?.source_identity
+    || !['captured', 'skipped-too-large'].includes(delta?.status)
+    || !sameResolvedPath(anchor.path, delta.path)
+    || anchor.offset < delta.start_offset
+    || anchor.offset > delta.end_offset) return false;
   try {
-    return readRange(file, start, end - start).toString('utf8')
-      .split(/\r?\n/)
-      .filter(Boolean)
-      .every((line) => ['compacted', 'world_state'].includes(JSON.parse(line).type));
+    const transcript = path.resolve(delta.path);
+    return sameTranscriptSource(transcript, fs.statSync(transcript), anchor);
   } catch {
     return false;
   }
@@ -381,6 +442,9 @@ function captureTranscriptDelta(input, meta, ctx, generation, env = process.env)
     start_offset: 0,
     end_offset: 0,
     bytes: 0,
+    source_bytes: 0,
+    stored_bytes: 0,
+    semantic_gap: false,
     sha256: sha256(''),
   };
   if (!transcript || !fs.existsSync(transcript)) return result;
@@ -397,9 +461,18 @@ function captureTranscriptDelta(input, meta, ctx, generation, env = process.env)
   const length = size - start;
   const maximum = Number.parseInt(env.CONTEXT_CHECKPOINT_MAX_DELTA_BYTES || '67108864', 10);
   if (!Number.isInteger(maximum) || maximum < 0 || length > maximum) {
-    return { ...result, status: 'too-large', mode: start === 0 ? 'reset' : 'append', start_offset: start, end_offset: start, bytes: length };
+    return {
+      ...result,
+      status: 'skipped-too-large',
+      mode: start === 0 ? 'reset' : 'append',
+      start_offset: start,
+      end_offset: size,
+      source_bytes: length,
+      semantic_gap: true,
+      source_identity: transcriptIdentity(transcript, stat, size),
+    };
   }
-  fs.mkdirSync(ctx.deltas, { recursive: true });
+  fs.mkdirSync(ctx.deltas, { recursive: true, mode: 0o700 });
   const deltaPath = path.join(ctx.deltas, `generation-${String(generation).padStart(4, '0')}.jsonl`);
   const copied = copyRange(transcript, start, length, deltaPath);
   return {
@@ -410,18 +483,21 @@ function captureTranscriptDelta(input, meta, ctx, generation, env = process.env)
     start_offset: start,
     end_offset: start + copied.bytes,
     bytes: copied.bytes,
+    source_bytes: length,
+    stored_bytes: copied.bytes,
+    semantic_gap: false,
     sha256: copied.sha256,
     source_identity: transcriptIdentity(transcript, stat, start + copied.bytes),
   };
 }
 
 function withLock(file, fn) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   let fd;
   let owned = false;
   try {
     try {
-      fd = fs.openSync(file, 'wx');
+      fd = fs.openSync(file, 'wx', 0o600);
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
       let age;
@@ -433,7 +509,7 @@ function withLock(file, fn) {
       if (age !== undefined && age <= 5 * 60 * 1000) return { action: 'locked' };
       try { fs.unlinkSync(file); } catch (unlinkError) { if (unlinkError.code !== 'ENOENT') throw unlinkError; }
       try {
-        fd = fs.openSync(file, 'wx');
+        fd = fs.openSync(file, 'wx', 0o600);
       } catch (retryError) {
         if (retryError.code === 'EEXIST') return { action: 'locked' };
         throw retryError;
@@ -460,16 +536,19 @@ function sidecarDue(checkpoint, meta, env) {
     && (meta.semantic_generation || 0) < checkpoint.generation;
 }
 
-function shouldRunSidecar(checkpoint, meta, env = process.env, unseenPaths = []) {
+function shouldRunSidecar(checkpoint, meta, env = process.env, backlog = {}) {
   if (!sidecarDue(checkpoint, meta, env)) return false;
+  const candidate = Array.isArray(backlog)
+    ? { complete: true, bytes: backlog.reduce((total, file) => total + fs.statSync(file).size, 0) }
+    : backlog;
+  if (!candidate.complete) return false;
   const minimum = Number.parseInt(env.CONTEXT_CHECKPOINT_SIDECAR_MIN_BYTES || '32768', 10);
-  const unseenBytes = unseenPaths.reduce((total, file) => total + fs.statSync(file).size, 0);
-  return unseenBytes >= Math.max(0, minimum || 0);
+  return candidate.bytes >= Math.max(0, minimum || 0);
 }
 
 function runSidecar(checkpoint, ctx, env = process.env, spawn = spawnSync) {
   const outputDir = path.join(ctx.sessionDir, 'sidecar');
-  fs.mkdirSync(outputDir, { recursive: true });
+  fs.mkdirSync(outputDir, { recursive: true, mode: 0o700 });
   const output = path.join(outputDir, `generation-${String(checkpoint.generation).padStart(4, '0')}.json`);
   const schema = path.resolve(__dirname, '..', 'schemas', 'semantic-checkpoint.schema.json');
   const prompt = [
@@ -478,7 +557,9 @@ function runSidecar(checkpoint, ctx, env = process.env, spawn = spawnSync) {
     'Keep the current goal, acceptance criteria, constraints, decisions, progress, negative knowledge, open questions, and exact next actions.',
     'Drop raw logs, repetition, superseded plans, obsolete assumptions, and resolved questions. Do not modify files.',
     `Transcript deltas since the last semantic checkpoint: ${JSON.stringify(checkpoint.sidecar_delta_paths)}`,
-    `Previous semantic state: ${JSON.stringify(checkpoint.semantic)}`,
+    `Previous semantic state: ${JSON.stringify(
+      checkpoint.sidecar_backlog_reset ? emptySemantic() : checkpoint.semantic,
+    )}`,
   ].join('\n');
   const args = [
     'exec', '--ephemeral', '--sandbox', 'read-only', '--skip-git-repo-check',
@@ -518,19 +599,96 @@ function runSidecar(checkpoint, ctx, env = process.env, spawn = spawnSync) {
   }
 }
 
-function unseenDeltaPaths(ctx, semanticGeneration, checkpoint) {
+function collectUnseenDeltas(ctx, semanticGeneration, checkpoint) {
   const paths = [];
+  let bytes = 0;
+  let reset = false;
+  let expectedPath = checkpoint.semantic_transcript?.path || null;
+  let expectedOffset = checkpoint.semantic_transcript?.end_offset || 0;
+  let expectedIdentity = checkpoint.semantic_transcript?.source_identity || null;
+  let gap = semanticGeneration > 0 && !checkpoint.semantic_transcript
+    ? { reason: 'semantic_coverage_missing', generation: semanticGeneration }
+    : null;
   for (let generation = semanticGeneration + 1; generation <= checkpoint.generation; generation += 1) {
-    const state = generation === checkpoint.generation
-      ? checkpoint
-      : readJson(historyPath(ctx, generation));
-    if (state?.status === 'interrupted') continue;
-    const delta = state?.transcript_delta;
-    if (delta?.status === 'captured' && delta.delta_path && fs.existsSync(delta.delta_path)) {
-      paths.push(delta.delta_path);
+    let state;
+    try {
+      state = generation === checkpoint.generation
+        ? checkpoint
+        : readJson(historyPath(ctx, generation));
+    } catch {
+      gap ||= { reason: 'history_invalid', generation };
+      continue;
     }
+    if (!state) {
+      gap ||= { reason: 'history_missing', generation };
+      continue;
+    }
+    if (state.status === 'interrupted') continue;
+    const delta = state?.transcript_delta;
+    if (delta?.status !== 'captured') {
+      gap ||= { reason: `delta_${delta?.status || 'missing'}`, generation };
+      continue;
+    }
+    if (!delta.path
+      || !delta.source_identity
+      || !Number.isInteger(delta.start_offset)
+      || !Number.isInteger(delta.end_offset)
+      || !Number.isInteger(delta.bytes)
+      || delta.start_offset < 0
+      || delta.end_offset < delta.start_offset) {
+      gap ||= { reason: 'delta_metadata_invalid', generation };
+      continue;
+    }
+    if (!delta.delta_path || !fs.existsSync(delta.delta_path)) {
+      gap ||= { reason: 'delta_file_missing', generation };
+      continue;
+    }
+    let size;
+    try { size = fs.statSync(delta.delta_path).size; } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      gap ||= { reason: 'delta_file_missing', generation };
+      continue;
+    }
+    if (delta.end_offset - delta.start_offset !== size || delta.bytes !== size) {
+      gap ||= { reason: 'delta_file_size_mismatch', generation };
+      continue;
+    }
+    if (delta.mode === 'reset' && delta.start_offset === 0) {
+      paths.length = 0;
+      bytes = 0;
+      reset = true;
+      gap = null;
+    } else {
+      let sameSource = false;
+      if (expectedPath && expectedIdentity) {
+        try {
+          const transcript = path.resolve(delta.path);
+          const stat = fs.statSync(transcript);
+          sameSource = sameTranscriptSource(transcript, stat, {
+            path: expectedPath,
+            offset: expectedOffset,
+            source_identity: expectedIdentity,
+          });
+        } catch {}
+      }
+      if (delta.mode !== 'append'
+        || delta.start_offset > expectedOffset
+        || delta.end_offset < expectedOffset
+        || (expectedPath && !sameSource)
+        || (!expectedPath && delta.start_offset !== 0)) {
+        gap ||= { reason: 'delta_range_gap', generation };
+        continue;
+      }
+      gap = null;
+    }
+    paths.push(delta.delta_path);
+    bytes += size;
+    expectedPath = delta.path;
+    expectedOffset = delta.end_offset;
+    expectedIdentity = delta.source_identity;
   }
-  return paths;
+  if (gap) return { complete: false, ...gap };
+  return { complete: true, paths, bytes, reset };
 }
 
 function historyPath(ctx, generation) {
@@ -542,7 +700,7 @@ function pruneOldGenerations(ctx, generation, semanticGeneration, env) {
   if (!Number.isInteger(retain) || retain < 1 || generation <= retain) return;
   const cutoff = Math.min(generation - retain, semanticGeneration || 0);
   if (cutoff < 1) return;
-  for (const directory of [ctx.history, ctx.deltas]) {
+  for (const directory of [ctx.history, ctx.deltas, path.join(ctx.sessionDir, 'sidecar')]) {
     let entries;
     try { entries = fs.readdirSync(directory); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
     for (const entry of entries) {
@@ -565,6 +723,9 @@ function clearRecovery(file) {
 function armRecovery(ctx, checkpoint) {
   writeJson(ctx.recovery, {
     generation: checkpoint.generation,
+    session_id: checkpoint.session_id,
+    agent_id: checkpoint.agent_id,
+    thread_id: checkpoint.thread_id,
     turn_id: checkpoint.turn_id,
     created_at: now(),
   });
@@ -585,6 +746,8 @@ function handlePreCompact(input, env, deps) {
     });
     const previous = readJson(ctx.current);
     clearRecovery(ctx.recovery);
+    const legacyRecovery = verifiedLegacyRecoveryPath(input, env);
+    if (legacyRecovery) clearRecovery(legacyRecovery);
     if (!Number.isInteger(meta.completed_generations)) {
       meta.completed_generations = previous?.status === 'complete'
         ? meta.generation
@@ -602,6 +765,11 @@ function handlePreCompact(input, env, deps) {
     }
 
     const generation = meta.generation + 1;
+    const transcriptDelta = captureTranscriptDelta(input, meta, ctx, generation, env);
+    const manualCarry = previous?.semantic_source === 'manual'
+      && meta.manual_semantic_anchor?.generation === previous.generation
+      && manualAnchorCoversDelta(meta.manual_semantic_anchor, transcriptDelta);
+    delete meta.manual_semantic_anchor;
     const checkpoint = {
       schema_version: SCHEMA_VERSION,
       session_id: input.session_id,
@@ -614,7 +782,7 @@ function handlePreCompact(input, env, deps) {
       model: input.model || null,
       created_at: now(),
       workspace_before: ctx.workspace,
-      transcript_delta: captureTranscriptDelta(input, meta, ctx, generation, env),
+      transcript_delta: transcriptDelta,
       semantic: previous?.semantic || emptySemantic(),
       semantic_generation: previous?.semantic_generation || 0,
       semantic_source: previous?.semantic_source || 'empty',
@@ -626,18 +794,24 @@ function handlePreCompact(input, env, deps) {
     writeJson(ctx.meta, meta);
     writeCheckpoint(ctx, checkpoint);
 
-    if (semanticCoversDelta(checkpoint.semantic_transcript, checkpoint.transcript_delta)) {
+    if (manualCarry || semanticCoversDelta(checkpoint.semantic_transcript, checkpoint.transcript_delta)) {
       checkpoint.semantic_generation = generation;
+      checkpoint.semantic_transcript = {
+        path: checkpoint.transcript_delta.path,
+        end_offset: checkpoint.transcript_delta.end_offset,
+        source_identity: checkpoint.transcript_delta.source_identity,
+      };
       meta.semantic_generation = generation;
       writeCheckpoint(ctx, checkpoint);
       writeJson(ctx.meta, meta);
     }
 
-    const unseenPaths = sidecarDue(checkpoint, meta, env)
-      ? unseenDeltaPaths(ctx, meta.semantic_generation || 0, checkpoint)
-      : [];
-    if (shouldRunSidecar(checkpoint, meta, env, unseenPaths)) {
-      checkpoint.sidecar_delta_paths = unseenPaths;
+    const backlog = sidecarDue(checkpoint, meta, env)
+      ? collectUnseenDeltas(ctx, meta.semantic_generation || 0, checkpoint)
+      : null;
+    if (shouldRunSidecar(checkpoint, meta, env, backlog || {})) {
+      checkpoint.sidecar_delta_paths = backlog.paths;
+      checkpoint.sidecar_backlog_reset = backlog.reset;
       checkpoint.sidecar = deps.runSidecar(checkpoint, ctx, env, deps.spawnSync);
       if (checkpoint.sidecar.status === 'completed') {
         checkpoint.semantic = checkpoint.sidecar.semantic;
@@ -652,6 +826,7 @@ function handlePreCompact(input, env, deps) {
         meta.semantic_generation = generation;
       }
       delete checkpoint.sidecar_delta_paths;
+      delete checkpoint.sidecar_backlog_reset;
       writeCheckpoint(ctx, checkpoint);
       writeJson(ctx.meta, meta);
     }
@@ -659,20 +834,42 @@ function handlePreCompact(input, env, deps) {
   });
 }
 
-function handlePostCompact(input, env) {
-  const ctx = resolveContext(input, env);
+function finishCheckpoint(ctx, input, env, completionSource) {
+  const stale = completionSource === 'postcompact' ? 'stale-postcompact' : 'stale-sessionstart';
   return withLock(ctx.lock, () => {
     const meta = readJson(ctx.meta);
     const checkpoint = readJson(ctx.current);
-    if (!meta || !checkpoint || checkpoint.status !== 'preparing' || checkpoint.turn_id !== input.turn_id) {
-      return { action: 'stale-postcompact' };
+    if (!meta
+      || !checkpoint
+      || checkpoint.session_id !== input.session_id
+      || !sameResolvedPath(checkpoint.transcript_delta?.path, input.transcript_path)
+      || (completionSource === 'postcompact' && checkpoint.turn_id !== input.turn_id)
+      || (completionSource === 'sessionstart-fallback' && (input.agent_id || checkpoint.agent_id))) {
+      return { action: stale };
     }
+    if (checkpoint.status === 'complete') {
+      return { action: 'already-complete', generation: checkpoint.generation };
+    }
+    if (checkpoint.status !== 'preparing') return { action: stale };
     checkpoint.status = 'complete';
     checkpoint.completed_at = now();
+    checkpoint.completion_source = completionSource;
     checkpoint.workspace_after = ctx.workspace;
+    const transcript = input.transcript_path ? path.resolve(input.transcript_path) : null;
+    checkpoint.postcompact_transcript = null;
+    if (transcript) {
+      try {
+        const stat = fs.statSync(transcript);
+        checkpoint.postcompact_transcript = {
+          path: transcript,
+          end_offset: stat.size,
+          source_identity: transcriptIdentity(transcript, stat),
+        };
+      } catch {}
+    }
     meta.pending_turn_id = null;
     meta.completed_generations = (meta.completed_generations || 0) + 1;
-    if (checkpoint.transcript_delta.status === 'captured') {
+    if (['captured', 'skipped-too-large'].includes(checkpoint.transcript_delta.status)) {
       meta.cursor = {
         path: checkpoint.transcript_delta.path,
         offset: checkpoint.transcript_delta.end_offset,
@@ -687,7 +884,45 @@ function handlePostCompact(input, env) {
   });
 }
 
-function assessRestore(checkpoint, ctx) {
+function handlePostCompact(input, env) {
+  const ctx = resolveLifecycleContext(input, env);
+  if (!ctx) return { action: 'stale-postcompact' };
+  return finishCheckpoint(ctx, input, env, 'postcompact');
+}
+
+function isHostLifecycleTail(transcript, start, end, turnId, currentTurnId) {
+  const length = end - start;
+  const prefixOnly = typeof currentTurnId === 'string' && currentTurnId.length > 0;
+  if (currentTurnId !== null && !prefixOnly) return false;
+  if (length <= 0 || (!prefixOnly && length > 64 * 1024)) return false;
+  try {
+    const lines = readRange(transcript, start, Math.min(length, 64 * 1024))
+      .toString('utf8')
+      .split(/\r?\n/)
+      .filter(Boolean);
+    const records = [];
+    for (const line of lines) {
+      const record = JSON.parse(line);
+      if (prefixOnly
+        && record?.type === 'event_msg'
+        && record.payload?.type === 'item_completed'
+        && record.payload.item?.type === 'SubAgentActivity') continue;
+      records.push(record);
+      if (prefixOnly && records.length === 3) break;
+    }
+    const expected = ['task_complete', 'thread_settings_applied', 'task_started'];
+    return records.length > 0 && records.length <= expected.length
+      && (!prefixOnly || records.length === expected.length)
+      && records.every((record, index) => (
+        record?.type === 'event_msg' && record.payload?.type === expected[index]
+      )) && records[0].payload.turn_id === turnId
+      && (!prefixOnly || records[2].payload.turn_id === currentTurnId);
+  } catch {
+    return false;
+  }
+}
+
+function assessRestore(checkpoint, ctx, allowHostCompletionTail = false, currentTurnId) {
   if (!checkpoint) return { restore_eligible: false, restore_reason: 'checkpoint_missing' };
   if (checkpoint.status !== 'complete') return { restore_eligible: false, restore_reason: 'checkpoint_incomplete' };
   if (checkpoint.workspace_before.identity !== ctx.workspace.identity) {
@@ -697,57 +932,150 @@ function assessRestore(checkpoint, ctx) {
   if (!semantic.goal && !SEMANTIC_KEYS.some((key) => semantic[key]?.length)) {
     return { restore_eligible: false, restore_reason: 'semantic_empty' };
   }
-  const coverage = checkpoint.semantic_transcript;
-  const transcript = checkpoint.transcript_delta.path;
-  if (!coverage) return { restore_eligible: false, restore_reason: 'coverage_missing' };
-  if (!transcript || !fs.existsSync(transcript)) {
-    return { restore_eligible: false, restore_reason: 'transcript_missing' };
+  try {
+    validateSemantic(semantic);
+  } catch (error) {
+    return {
+      restore_eligible: false,
+      restore_reason: /restore payload/.test(error.message)
+        ? 'semantic_payload_too_large'
+        : 'semantic_invalid',
+    };
   }
-  const stat = fs.statSync(transcript);
+  const coverage = checkpoint.semantic_transcript;
+  if (!coverage) return { restore_eligible: false, restore_reason: 'coverage_missing' };
   if (coverage.end_offset !== checkpoint.transcript_delta.end_offset) {
     return { restore_eligible: false, restore_reason: 'coverage_mismatch' };
   }
-  if (stat.size < coverage.end_offset
-    || !sameTranscriptSource(path.resolve(transcript), stat, {
+  const snapshot = checkpoint.semantic_snapshot || checkpoint.postcompact_transcript;
+  if (!snapshot) return { restore_eligible: false, restore_reason: 'postcompact_snapshot_missing' };
+  const transcript = snapshot.path;
+  if (!transcript || !fs.existsSync(transcript)) {
+    return { restore_eligible: false, restore_reason: 'transcript_missing' };
+  }
+  let stat;
+  try { stat = fs.statSync(transcript); } catch {
+    return { restore_eligible: false, restore_reason: 'transcript_unavailable' };
+  }
+  if (stat.size !== snapshot.end_offset
+    && !(allowHostCompletionTail
+      && stat.size > snapshot.end_offset
+      && isHostLifecycleTail(
+        transcript, snapshot.end_offset, stat.size, checkpoint.turn_id, currentTurnId,
+      ))) {
+    return { restore_eligible: false, restore_reason: 'unexpected_transcript_tail' };
+  }
+  let semanticSource = false;
+  try {
+    semanticSource = sameTranscriptSource(path.resolve(transcript), stat, {
       path: coverage.path,
       offset: coverage.end_offset,
       source_identity: coverage.source_identity,
-    })) {
-    return { restore_eligible: false, restore_reason: 'transcript_source_changed' };
+    });
+  } catch {}
+  if (!semanticSource) {
+    return { restore_eligible: false, restore_reason: 'semantic_source_changed' };
   }
-  if (!onlyCompactionMetadata(transcript, coverage.end_offset, stat.size)) {
-    return { restore_eligible: false, restore_reason: 'unexpected_transcript_tail' };
+  let sameSource = false;
+  try {
+    sameSource = sameTranscriptSource(path.resolve(transcript), stat, {
+      path: snapshot.path,
+      offset: snapshot.end_offset,
+      source_identity: snapshot.source_identity,
+    });
+  } catch {}
+  if (!sameSource) {
+    return { restore_eligible: false, restore_reason: 'transcript_source_changed' };
   }
   return { restore_eligible: true, restore_reason: 'eligible' };
 }
 
-function deliverRecovery(input, env, hookEventName, emitHookOutput) {
-  const pendingPath = recoveryPath(input, env);
-  if (!fs.existsSync(pendingPath)) return null;
-  const ctx = resolveContext(input, env, false);
+function deliverRecovery(input, env, hookEventName, emitHookOutput, resolvedContext = null) {
+  const ctx = resolvedContext || (hookEventName === 'UserPromptSubmit'
+    ? resolveLifecycleContext(input, env, false)
+    : resolveContext(input, env, false));
+  if (!ctx) return null;
+  const storedIdentity = readJson(ctx.current);
+  const recoveryInput = storedIdentity
+    ? {
+      ...input,
+      session_id: storedIdentity.session_id,
+      agent_id: storedIdentity.agent_id || undefined,
+    }
+    : input;
+  const legacyRecovery = verifiedLegacyRecoveryPath(recoveryInput, env);
+  const recovery = fs.existsSync(ctx.recovery) ? ctx.recovery : legacyRecovery;
+  if (!recovery) return null;
+  const clearPending = () => {
+    clearRecovery(ctx.recovery);
+    if (legacyRecovery) clearRecovery(legacyRecovery);
+  };
   const result = withLock(ctx.lock, () => {
     const checkpoint = readJson(ctx.current);
-    const pending = readJson(ctx.recovery);
+    const pending = readJson(recovery);
     if (!pending || pending.generation !== checkpoint?.generation) return null;
-    if (!assessRestore(checkpoint, ctx).restore_eligible) {
-      clearRecovery(ctx.recovery);
+    const legacyThreadId = String(checkpoint.agent_id || checkpoint.session_id);
+    if (pending.thread_id && ![ctx.threadId, legacyThreadId].includes(pending.thread_id)) return null;
+    if (!sameResolvedPath(checkpoint.transcript_delta?.path, input.transcript_path)) return null;
+    const allowHostCompletionTail = hookEventName === 'SessionStart'
+      || hookEventName === 'UserPromptSubmit';
+    const currentTurnId = hookEventName === 'UserPromptSubmit' ? input.turn_id : null;
+    const assessment = assessRestore(checkpoint, ctx, allowHostCompletionTail, currentTurnId);
+    if (!assessment.restore_eligible) {
+      if (hookEventName !== 'SessionStart'
+        || assessment.restore_reason !== 'unexpected_transcript_tail') clearPending();
       return null;
     }
+    const additionalContext = renderRestoreContext(checkpoint);
     const output = {
       hookSpecificOutput: {
         hookEventName,
-        additionalContext: renderRestoreContext(checkpoint),
+        additionalContext,
       },
     };
+    const meta = readJson(ctx.meta, {});
+    const previous = meta.last_recovery_delivery;
+    const receipt = {
+      generation: checkpoint.generation,
+      event: hookEventName,
+      attempt_count: previous?.generation === checkpoint.generation
+        ? (previous.attempt_count || 0) + 1
+        : 1,
+      attempted_at: now(),
+      payload_bytes: Buffer.byteLength(additionalContext, 'utf8'),
+      payload_sha256: sha256(additionalContext),
+      status: 'attempting',
+      error: null,
+    };
+    meta.last_recovery_delivery = receipt;
+    writeJson(ctx.meta, meta);
     if (emitHookOutput) {
-      emitHookOutput(output);
-      clearRecovery(ctx.recovery);
-      return { action: 'delivered' };
+      try {
+        emitHookOutput(output);
+      } catch (error) {
+        receipt.status = 'output_failed';
+        receipt.error = String(error?.message || error).slice(0, 2000);
+        writeJson(ctx.meta, meta);
+        throw error;
+      }
     }
-    clearRecovery(ctx.recovery);
-    return output;
+    receipt.status = 'local_output_succeeded';
+    receipt.local_output_succeeded_at = now();
+    writeJson(ctx.meta, meta);
+    clearPending();
+    return emitHookOutput ? { action: 'delivered' } : output;
   });
   return result?.action === 'locked' ? null : result;
+}
+
+function clearManualSemanticAnchor(ctx) {
+  if (!ctx) return;
+  withLock(ctx.lock, () => {
+    const meta = readJson(ctx.meta);
+    if (!meta?.manual_semantic_anchor) return;
+    delete meta.manual_semantic_anchor;
+    writeJson(ctx.meta, meta);
+  });
 }
 
 function handleHook(input, env = process.env, deps = {}) {
@@ -755,10 +1083,20 @@ function handleHook(input, env = process.env, deps = {}) {
   if (input.hook_event_name === 'PreCompact') return handlePreCompact(input, env, resolved);
   if (input.hook_event_name === 'PostCompact') return handlePostCompact(input, env);
   if (input.hook_event_name === 'SessionStart' && input.source === 'compact') {
-    return deliverRecovery(input, env, 'SessionStart', resolved.emitHookOutput);
+    let ctx = null;
+    if (!input.agent_id) {
+      ctx = resolveContext(input, env);
+      finishCheckpoint(ctx, input, env, 'sessionstart-fallback');
+    }
+    return deliverRecovery(input, env, 'SessionStart', resolved.emitHookOutput, ctx);
   }
   if (input.hook_event_name === 'UserPromptSubmit') {
-    return deliverRecovery(input, env, 'UserPromptSubmit', resolved.emitHookOutput);
+    const ctx = resolveLifecycleContext(input, env, false);
+    try {
+      return deliverRecovery(input, env, 'UserPromptSubmit', resolved.emitHookOutput, ctx);
+    } finally {
+      clearManualSemanticAnchor(ctx);
+    }
   }
   return null;
 }
@@ -795,6 +1133,42 @@ function directorySize(directory) {
   return total;
 }
 
+function discoverWorkspaceIdentities(env, workspace) {
+  if (env.CONTEXT_CHECKPOINT_DATA_DIR) return [];
+  const pluginLayout = Boolean(env.PLUGIN_DATA);
+  const root = pluginLayout
+    ? path.join(path.resolve(env.PLUGIN_DATA), 'workspaces')
+    : path.join(
+      path.resolve(env.CODEX_HOME || path.join(os.homedir(), '.codex')),
+      'plugin-data', 'context-checkpoint', 'workspaces',
+    );
+  let entries;
+  try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+  const alternates = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name === workspace.identity) continue;
+    const base = pluginLayout
+      ? path.join(root, entry.name, 'context-checkpoint')
+      : path.join(root, entry.name);
+    const matches = listSessions(base)
+      .map((storage) => readJson(path.join(base, 'sessions', storage, 'current.json')))
+      .filter((current) => current?.workspace_before?.root
+        && sameResolvedPath(current.workspace_before.root, workspace.root));
+    if (!matches.length) continue;
+    alternates.push({
+      identity: entry.name,
+      root: path.resolve(matches[0].workspace_before.root),
+      git: Boolean(matches[0].workspace_before.git),
+      threads: matches.length,
+      stored_bytes: directorySize(base),
+    });
+  }
+  return alternates.sort((left, right) => left.identity.localeCompare(right.identity));
+}
+
 function listHistory(ctx) {
   let entries;
   try { entries = fs.readdirSync(ctx.history); } catch (error) {
@@ -821,19 +1195,39 @@ function cliContext(env, threadId, sessionId) {
   const base = cliBase(env, workspace);
   const sessions = listSessions(base);
   if (threadId && sessionId) throw new Error('pass either --thread-id or --session-id, not both');
-  if (!threadId && !sessionId && sessions.length > 1) {
-    throw new Error(`multiple threads found; pass --thread-id (${sessions.join(', ')})`);
+  const records = sessions.map((storage) => ({
+    storage,
+    current: readJson(path.join(base, 'sessions', storage, 'current.json')),
+  }));
+  if (!threadId && !sessionId && records.length > 1) {
+    const selectors = records.map(({ current, storage }) => (
+      current ? logicalThreadId(current) : storage
+    ));
+    throw new Error(`multiple threads found; pass --thread-id (${selectors.join(', ')})`);
   }
-  let selectedId = threadId ? safeSegment(threadId) : sessions[0];
+  let selectedRecord = records.length === 1 && !threadId && !sessionId ? records[0] : null;
+  if (threadId) {
+    const exact = records.filter(({ current }) => current
+      && (logicalThreadId(current) === threadId
+        || current.thread_id === threadId
+        || (!current.agent_id && current.session_id === threadId)
+        || (current.agent_id && `${current.session_id}:${current.agent_id}` === threadId)));
+    if (exact.length > 1) throw new Error(`multiple threads match ${threadId}`);
+    [selectedRecord] = exact;
+    if (!selectedRecord) {
+      const aliases = records.filter(({ current }) => current?.agent_id === threadId);
+      if (aliases.length > 1) {
+        throw new Error(`multiple threads match ${threadId}; use the canonical selector from sessions`);
+      }
+      [selectedRecord] = aliases;
+    }
+  }
   if (sessionId) {
-    const rootTasks = sessions.filter((id) => {
-      const current = readJson(path.join(base, 'sessions', id, 'current.json'));
-      return current?.session_id === sessionId && !current.agent_id;
-    });
+    const rootTasks = records.filter(({ current }) => current?.session_id === sessionId && !current.agent_id);
     if (rootTasks.length !== 1) throw new Error(`no root task found for session ${sessionId}`);
-    [selectedId] = rootTasks;
+    [selectedRecord] = rootTasks;
   }
-  const selected = selectedId ? path.join(base, 'sessions', selectedId) : null;
+  const selected = selectedRecord ? path.join(base, 'sessions', selectedRecord.storage) : null;
   if (!selected || !pathInside(base, selected)) {
     throw new Error('no checkpoint found for this workspace');
   }
@@ -846,7 +1240,7 @@ function cliContext(env, threadId, sessionId) {
     meta: path.join(selected, 'state.json'),
     history: path.join(selected, 'history'),
     lock: path.join(selected, '.lock'),
-    recovery: recoveryPath({ session_id: selectedId }, env),
+    recovery: recoveryPath(selectedRecord.current, env),
   };
 }
 
@@ -860,16 +1254,24 @@ function runCli(argv, env) {
   if (command === 'sessions') {
     const workspace = workspaceSnapshot(process.cwd());
     const base = cliBase(env, workspace);
+    if (argv.includes('--discover')) {
+      process.stdout.write(`${JSON.stringify({
+        current_workspace_identity: workspace.identity,
+        alternate_identities: discoverWorkspaceIdentities(env, workspace),
+      }, null, 2)}\n`);
+      return;
+    }
     const includeStorage = argv.includes('--storage');
-    const sessions = listSessions(base).map((sessionId) => {
-      const sessionDir = path.join(base, 'sessions', sessionId);
+    const sessions = listSessions(base).map((storage) => {
+      const sessionDir = path.join(base, 'sessions', storage);
       const current = readJson(path.join(sessionDir, 'current.json'));
+      const threadId = current ? logicalThreadId(current) : storage;
       const summary = {
-        selector: current?.thread_id || sessionId,
+        selector: threadId,
         kind: current?.agent_id ? 'agent' : 'root',
-        session_id: current?.session_id || sessionId,
+        session_id: current?.session_id || storage,
         agent_id: current?.agent_id || null,
-        thread_id: current?.thread_id || sessionId,
+        thread_id: threadId,
         generation: current?.generation || 0,
         status: current?.status || 'unknown',
         delta_bytes: current?.transcript_delta?.bytes || 0,
@@ -882,7 +1284,7 @@ function runCli(argv, env) {
         });
       }
       return summary;
-    });
+    }).sort((left, right) => left.selector.localeCompare(right.selector));
     const output = includeStorage
       ? {
         sessions,
@@ -896,10 +1298,14 @@ function runCli(argv, env) {
   const checkpoint = readJson(ctx.current);
   if (!checkpoint) throw new Error('checkpoint state is missing');
   if (command === 'status') {
+    const backlog = collectUnseenDeltas(ctx, checkpoint.semantic_generation || 0, checkpoint);
     process.stdout.write(`${JSON.stringify({
       ...checkpoint,
       ...assessRestore(checkpoint, ctx),
-      unseen_delta_paths: unseenDeltaPaths(ctx, checkpoint.semantic_generation || 0, checkpoint),
+      semantic_backlog_complete: backlog.complete,
+      semantic_backlog_reason: backlog.complete ? null : backlog.reason,
+      semantic_backlog_gap_generation: backlog.complete ? null : backlog.generation,
+      unseen_delta_paths: backlog.complete ? backlog.paths : [],
     }, null, 2)}\n`);
     return;
   }
@@ -937,19 +1343,45 @@ function runCli(argv, env) {
     const result = withLock(ctx.lock, () => {
       const current = readJson(ctx.current);
       const meta = readJson(ctx.meta);
+      if (!current || current.status !== 'complete') {
+        throw new Error('semantic requires a complete checkpoint');
+      }
+      const cursor = meta?.cursor;
+      if (!cursor?.path
+        || !cursor.source_identity
+        || !Number.isInteger(cursor.offset)
+        || !sameResolvedPath(cursor.path, current.transcript_delta?.path)
+        || cursor.offset !== current.transcript_delta?.end_offset
+        || !fs.existsSync(cursor.path)) {
+        throw new Error('semantic requires a committed transcript cursor');
+      }
+      const transcript = path.resolve(cursor.path);
+      const stat = fs.statSync(transcript);
+      if (!sameTranscriptSource(transcript, stat, cursor)) {
+        throw new Error('committed transcript source has changed');
+      }
+      const liveIdentity = transcriptIdentity(transcript, stat);
       current.semantic = semantic;
       current.semantic_generation = current.generation;
       current.semantic_source = 'manual';
       current.semantic_updated_at = now();
-      const transcriptPath = current.transcript_delta.path;
-      current.semantic_transcript = transcriptPath && fs.existsSync(transcriptPath)
-        ? {
-          path: transcriptPath,
-          end_offset: fs.statSync(transcriptPath).size,
-          source_identity: transcriptIdentity(transcriptPath, fs.statSync(transcriptPath)),
-        }
-        : null;
+      current.semantic_transcript = {
+        path: transcript,
+        end_offset: cursor.offset,
+        source_identity: cursor.source_identity,
+      };
+      current.semantic_snapshot = {
+        path: transcript,
+        end_offset: stat.size,
+        source_identity: liveIdentity,
+      };
       meta.semantic_generation = current.generation;
+      meta.manual_semantic_anchor = {
+        generation: current.generation,
+        path: transcript,
+        offset: stat.size,
+        source_identity: liveIdentity,
+      };
       writeCheckpoint(ctx, current);
       writeJson(ctx.meta, meta);
     });

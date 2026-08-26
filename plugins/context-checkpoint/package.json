@@ -1,8 +1,8 @@
 {
   "name": "context-checkpoint-codex-plugin",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "private": true,
-  "description": "Deterministic recovery checkpoints around native Codex compaction.",
+  "description": "Deterministic compaction checkpoints with optional semantic recovery.",
   "license": "MIT",
   "author": "wcf778",
   "repository": "github:wcf778/codex-checkpoint",

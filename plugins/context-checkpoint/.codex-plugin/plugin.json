@@ -1,7 +1,7 @@
 {
   "name": "context-checkpoint",
-  "version": "0.3.1",
-  "description": "Keep compacted Codex tasks recoverable with deterministic lifecycle checkpoints.",
+  "version": "0.3.2",
+  "description": "Capture deterministic Codex compaction checkpoints, with optional semantic task-state recovery.",
   "author": {
     "name": "wcf778",
     "url": "https://github.com/wcf778"
@@ -13,8 +13,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex Checkpoint",
-    "shortDescription": "Preserve current task state across compaction.",
-    "longDescription": "Records transcript deltas and workspace state around Codex compaction, then restores a concise task checkpoint.",
+    "shortDescription": "Mechanical checkpoints; optional semantic recovery.",
+    "longDescription": "Deterministic hooks record transcript deltas and workspace state. A manual skill or opt-in sidecar creates the bounded semantic checkpoint used for freshness-gated one-shot recovery.",
     "developerName": "wcf778",
     "category": "Productivity",
     "capabilities": ["Local", "Lifecycle hooks"],

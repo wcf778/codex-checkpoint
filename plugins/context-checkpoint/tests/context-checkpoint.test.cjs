@@ -16,7 +16,7 @@ fs.mkdirSync(work, { recursive: true });
 
 function spawnHookCommand(command, options) {
   return process.platform === 'win32'
-    ? spawnSync('pwsh.exe', ['-NoProfile', '-Command', command], options)
+    ? spawnSync(command, { ...options, shell: process.env.ComSpec })
     : spawnSync(command, { ...options, shell: true });
 }
 

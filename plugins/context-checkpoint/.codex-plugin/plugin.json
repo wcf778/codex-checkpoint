@@ -1,6 +1,6 @@
 {
   "name": "context-checkpoint",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Capture deterministic Codex compaction checkpoints, with optional semantic task-state recovery.",
   "author": {
     "name": "wcf778",

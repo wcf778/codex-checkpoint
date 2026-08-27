@@ -74,6 +74,25 @@ The same deterministic benchmark also exercises the disposable sidecar projectio
 
 That fixture masks one base64 data URL and one explicit binary envelope, folds one exact oversized duplicate, preserves ordinary long text, deletes the derived view, and confirms the raw delta SHA-256 is unchanged. These are byte-proxy measurements for this fixture, not token savings.
 
+### Paired task-state retention acceptance (2026-08-27)
+
+A bounded real-host acceptance compared the three existing semantic fixtures under native compact alone and native compact plus checkpoint restore. Each fixture was extended with 1,800 neutral log lines (159,261–159,286 UTF-8 bytes). Both arms used fresh tasks, `gpt-5.6-sol`, the same input and compaction point, a real App Server [`thread/compact/start`](https://developers.openai.com/codex/app-server#trigger-thread-compaction), and the same structured post-compact probe. Scoring was exact-string and field-aware, with no LLM judge. There was one run per fixture and arm: six tasks total. The run used `codex-cli 0.150.0-alpha.8` and plugin v0.4.0; the probe used low reasoning effort, while compaction remained host-native.
+
+The restore arm wrote each fixture's predeclared semantic checkpoint immediately before the measured compact. This isolates restore retention; it does not measure semantic generation, which remains the separate purpose of `npm run benchmark:semantic`.
+
+| Result | Native compact | Checkpoint restore |
+| --- | ---: | ---: |
+| Predeclared task-state items retained in the correct field | 24/25 (96%) | **25/25 (100%)** |
+| Entire semantic fields exactly equal to the expected field | 22/24 (91.7%) | **23/24 (95.8%)** |
+| Execution-critical literals retained | 13/14 (92.9%) | **14/14 (100%)** |
+| Exact Constraints + Do not retry fields | 6/6 (100%) | 6/6 (100%) |
+| Forbidden-claim trap hits | 0 | 0 |
+| Successful `SessionStart` restore receipts | n/a | 3/3 |
+
+Native compact dropped the exact `plugins/context-checkpoint/hooks/context-checkpoint.cjs` path from one fixture; restore retained it. The dedicated constraint fields tied at 6/6, so this run observed an overall task-state retention advantage, not a constraint-field advantage. Both arms added the already-present `Command: npm test` as an extra next action in the release fixture, so neither arm achieved perfect field equality. All three restore receipts were `local_output_succeeded` (595–634-byte payloads), every probe returned valid JSON, and no probe used a tool.
+
+This small paired run shows better retention on these fixtures only. With three fixtures and one observation per arm, it is not a statistical or general task-quality claim. The one-off controller is intentionally not part of default tests or release gates.
+
 ### Lifecycle and failure-mode coverage
 
 The automated tests cover lock ownership, idempotency, interrupted completion reconciliation, transcript replacement and rewrite detection, lifecycle append recovery, one-shot root and subtask recovery, failed-output receipts and retry, restore diagnostics, semantic Goal/Next-action gates, exact deduplication and restore ordering, identity discovery, legacy path boundaries, retained-history inspection, storage reporting, retention, accumulated sidecar thresholds, delta checksum gates, disposable sidecar projection and byte telemetry, sidecar launch and semantic-quality constraints, recursion guards, CLI ambiguity, Windows launcher behavior, and bounded schema validation.

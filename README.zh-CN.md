@@ -74,6 +74,25 @@
 
 该 fixture 会替换 1 个 base64 data URL 和 1 个明确 binary envelope，折叠 1 个完全相同的超大重复项，保留普通长文本，删除派生 view，并确认原始 delta 的 SHA-256 未改变。这只是该 fixture 的输入字节代理，不是 Token 节省量。
 
+### 核心任务状态保留率对照验收（2026-08-27）
+
+一次有界的真实宿主验收，对比了现有 3 个 semantic fixture 在“仅原生 compact”与“原生 compact + checkpoint restore”下的表现。每个 fixture 都追加了 1,800 行中性日志（159,261–159,286 UTF-8 bytes）。两个条件均使用 fresh task、`gpt-5.6-sol`、相同输入与压缩点、真实 App Server [`thread/compact/start`](https://developers.openai.com/codex/app-server#trigger-thread-compaction)，以及相同的压缩后结构化 probe。评分采用字段感知的精确字符串检查，不使用 LLM judge。每个 fixture、每个条件各运行 1 次，共 6 个任务。本次运行使用 `codex-cli 0.150.0-alpha.8` 与插件 v0.4.0；probe 使用 low reasoning effort，compact 仍由宿主原生执行。
+
+Restore 条件在被测 compact 前写入该 fixture 预先标注的 semantic checkpoint，因此该验收隔离的是 restore retention，而不是 semantic 生成质量；后者仍由独立的 `npm run benchmark:semantic` 探针负责。
+
+| 结果 | 仅原生 compact | Checkpoint restore |
+| --- | ---: | ---: |
+| 在正确字段保留的预标注关键任务状态条目 | 24/25 (96%) | **25/25 (100%)** |
+| 与预期字段完全一致的 semantic 字段 | 22/24 (91.7%) | **23/24 (95.8%)** |
+| 保留的执行关键 literal | 13/14 (92.9%) | **14/14 (100%)** |
+| 完全一致的 Constraints + Do not retry 字段 | 6/6 (100%) | 6/6 (100%) |
+| 预设虚构陷阱命中数 | 0 | 0 |
+| 成功的 `SessionStart` restore receipt | 不适用 | 3/3 |
+
+原生 compact 在 1 个 fixture 中丢失了精确路径 `plugins/context-checkpoint/hooks/context-checkpoint.cjs`；restore 保留了该路径。专门的约束字段同为 6/6，因此本次观察到的是整体任务状态保留优势，而不是约束字段优势。两个条件都会在 release fixture 中把已有的 `Command: npm test` 额外加入 Next actions，因此都没有达到全部字段完全一致。3 个 restore receipt 均为 `local_output_succeeded`（payload 为 595–634 bytes），所有 probe 都返回有效 JSON，且未使用工具。
+
+该小型配对运行只说明 checkpoint restore 在这组 fixture 上保留得更好。3 个 fixture、每个条件 1 次观察不足以支持统计性结论或普遍任务质量声明。一次性 controller 刻意不加入默认测试或发布门禁。
+
 ### 生命周期与故障模式覆盖
 
 自动化测试覆盖锁所有权、幂等性、完成态中断协调、transcript 替换与原地重写检测、生命周期追加恢复、根任务与子任务的 one-shot 恢复、输出 receipt 与失败重试、恢复诊断、Goal/Next-action 语义 gate、精确去重与恢复排序、身份发现、legacy 路径边界、历史查看、容量报告、保留策略、sidecar 累计阈值、delta checksum gate、一次性 sidecar 投影与字节指标、sidecar 启动与语义质量约束、递归保护、CLI thread 歧义、Windows 启动器和有界 Schema 校验。
